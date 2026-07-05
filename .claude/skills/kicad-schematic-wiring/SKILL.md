@@ -98,9 +98,12 @@ most time, so a fresh agent can wire/relayout a schematic quickly and safely.
   auto-named like `Net-(U2-BST)` — that is correct, not a problem.
 - **Visual.** Render a region to a PNG **file** and `Read` it. Do NOT use
   `mcp__kicad__get_schematic_view` — it returns base64 inline and blows the tool
-  token limit. Use `scripts/render_region.py <sch> --region x1 y1 x2 y2`, which
-  writes a PNG and prints its path; then `Read` that path. One command instead of
-  the Edge-headless + System.Drawing pixel-crop pipeline.
+  token limit. Use `scripts/render_region.py <sch> --trim` (crops the empty page
+  margins) or `--region fx1 fy1 fx2 fy2` (a fraction of the page, e.g.
+  `0 0.02 0.42 0.72` for the lower-left), which writes a PNG and prints its path;
+  then `Read` that path. One command instead of the Edge-headless + System.Drawing
+  pixel-crop pipeline. NB: do NOT crop by `.kicad_sch` millimetres — KiCad's SVG
+  page coordinates are offset from the schematic's internal coordinates.
 
 ## ERC / symbol-quality notes
 
