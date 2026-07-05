@@ -116,8 +116,23 @@ most time, so a fresh agent can wire/relayout a schematic quickly and safely.
 
 ## Scripts
 
-- `scripts/render_region.py` — kicad-cli SVG → cairosvg PNG → optional mm-region
-  crop (PIL) → saves PNG, prints path. Run with KiCad's bundled python.
+- `scripts/relocate_group.py` — **the high-level "one call" op.** Places a template
+  group (currently a resistor `divider`) next to an IC pin and wires it: strips the
+  group's old net (BFS from the anchor pin, so neighbouring nets are untouched),
+  places a grid-aligned vertical stack, wires the internal mid node + power-end
+  global labels + an orthogonal tap route to the pin, auto-inserts junctions
+  (WireManager does this), keeps the Reference/Value text with the part, and
+  self-checks with an ERC baseline-diff. Reuses the KiCAD-MCP-Server primitives
+  (`PinLocator`, `WireManager`) and works in kicad-skip / raw `.kicad_sch`
+  coordinates. This is the piece that turns ~12 manual MCP ops per divider into one.
+  Known limits: `divider` template only; fixed-offset placement (no obstacle
+  avoidance yet — the ERC/visual gate catches a bad spot, then rerun with `--gap`).
+  Key implementation notes (skip gotchas): delete elements with `element.delete()`
+  (NOT `collection._elements.remove()` — that does not persist through
+  `overwrite()`); `WireManager` methods want a `pathlib.Path`, not a `str`; move a
+  symbol's field text by the same delta as its `at` or the labels get left behind.
+- `scripts/render_region.py` — kicad-cli SVG → cairosvg PNG → `--trim` / page-
+  fraction crop → saves PNG, prints path. Run with KiCad's bundled python.
 - `scripts/check_netlist.py` — assert intended net membership against an exported
   netlist (the "netlist contract" gate).
 
