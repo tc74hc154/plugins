@@ -1,8 +1,15 @@
-# min_wire_pack_rot.py — 選択フットプリントを最密（コートヤード枠線が距離0で密着）に詰めつつ、
-# 配線（ラッツネスト）総延長が最短になるように配置と90度刻みの回転を最適化する。
-# スカイライン法: 部品を1つずつ、既存の部品に密着する候補位置（左寄せ/右寄せ）×4方向のうち
-# 配線長が最短になる置き方を選ぶ。置く順番は焼きなまし法（部品数が少なければ全列挙）で最適化。
-# 選択外の部品・ネットは考慮しない。
+"""90度回転も使って、配線が最短になる並びで隙間ゼロに詰める
+
+選択フットプリントを最密（コートヤード枠線が距離0で密着）に詰めつつ、
+配線（ラッツネスト）総延長が最短になるように配置と90度刻みの回転を最適化する。
+
+スカイライン法: 部品を1つずつ、既存の部品に密着する候補位置（左寄せ/右寄せ）×4方向のうち
+配線長が最短になる置き方を選ぶ。置く順番は焼きなまし法（部品数が少なければ全列挙）で最適化。
+選択外の部品・ネットは考慮しない。
+
+実行中は進捗ダイアログ（経過バー・ラウンド数・改善回数・評価値）を表示し、
+暫定ベストの配置を基板にも随時描画する。「中止」を押すと、
+その時点のベスト配置のまま確定して終了する。"""
 import itertools
 import math
 import random
@@ -10,10 +17,17 @@ import time
 
 import pcbnew
 
+try:
+    import wx
+except ImportError:
+    wx = None
+
+ICON = "🔄"           # パレットのカードに表示するアイコン
 GAP_NM = 0            # 部品間ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
-TIME_BUDGET_S = 2.0   # 最適化に使う時間 [秒]。増やすほど良い解になりやすい
+TIME_BUDGET_S = 60.0  # 最適化に使う時間 [秒]。増やすほど良い解になりやすい
 MAX_ROW_WIDTH_MM = 0  # 配置ブロックの最大幅 [mm]。0なら全体が正方形に近づくよう自動設定
 DENSITY_WEIGHT = 1.0  # 密度の重み: 全体の高さ1nm増加を配線長何nm相当として罰するか
+LIVE_UPDATE_S = 0.2   # 暫定ベスト解を画面に反映する最短間隔 [秒]。0なら最後だけ描画
 
 try:
     ANGLE_90 = pcbnew.ANGLE_90
@@ -93,7 +107,7 @@ class MinWirePackRot(pcbnew.ActionPlugin):
         self.name = "Min-Wire Dense Pack Selected (rotate 90)"
         self.category = "Placement"
         self.description = "Pack selected footprints densely, optimizing position and 90-deg rotation for shortest ratsnest"
-        self.show_toolbar_button = True
+        self.show_toolbar_button = False  # ツールバーには pack_launcher だけを出す
 
     def Run(self):
         board = pcbnew.GetBoard()
@@ -216,68 +230,198 @@ class MinWirePackRot(pcbnew.ActionPlugin):
         def cost(order):
             return pack(order)[2]
 
+        cur_k = [0] * n       # 各部品の現在の向き（実測基準からの90度単位）
+        last_draw = [0.0]
+
+        def apply_placement(order):
+            """orderで詰めた結果を実際の基板に反映する。何度呼んでも整合する。"""
+            pos, ori, _ = pack(order)
+            min_px = min(p[0] for p in pos)
+            min_py = min(p[1] for p in pos)
+            origin_x = min(p[0] for p in cur_pos) - min_px
+            origin_y = min(p[1] for p in cur_pos) - min_py
+            for i, fp in enumerate(fps):
+                k = ori[i]
+                for _ in range((k - cur_k[i]) % 4):
+                    fp.Rotate(fp.GetPosition(), ANGLE_90)
+                cur_k[i] = k
+                v = next(v for v in variants[i] if v["k"] == k)
+                target = pcbnew.VECTOR2I(origin_x + pos[i][0], origin_y + pos[i][1]) + v["off"]
+                fp.SetPosition(target)
+
+        progress = [None]     # wx.ProgressDialog（初回tick時に遅延生成）
+        cancelled = [False]
+        last_tick = [time.time()]  # 開始直後0.1秒はダイアログを出さない
+        improves = [0]        # ベスト解を更新した回数（進捗表示用）
+
+        def tick(frac, msg):
+            """進捗ダイアログを更新しGUIイベントを回す。「中止」が押されたらFalse。
+            ダイアログは初回呼び出し時に作る（瞬時に終わる場合は出さない）。
+            Update()がイベントを処理するので「応答なし」防止も兼ねる。"""
+            if wx is None or cancelled[0]:
+                return not cancelled[0]
+            now = time.time()
+            if now - last_tick[0] < 0.1:
+                return True
+            last_tick[0] = now
+            if progress[0] is None:
+                progress[0] = wx.ProgressDialog(
+                    "Min-Wire Dense Pack (rotate 90)", msg, maximum=1000,
+                    parent=wx.FindWindowByName("PcbFrame"),
+                    style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_ELAPSED_TIME,
+                )
+            keep = progress[0].Update(max(0, min(999, int(frac * 1000))), msg)[0]
+            # ネイティブ実装のUpdate()はメインスレッドのイベントを回さないことがあるので、
+            # 基板の再描画と「応答なし」防止のため明示的にyieldする(ダイアログは無効化しない)
+            wx.SafeYield(progress[0])
+            if not keep:
+                cancelled[0] = True
+            return keep
+
+        def live_update(order):
+            """暫定ベストを間引きつつ基板に描画し、進捗を目に見えるようにする。"""
+            if LIVE_UPDATE_S <= 0:
+                return
+            now = time.time()
+            if now - last_draw[0] < LIVE_UPDATE_S:
+                return
+            last_draw[0] = now
+            apply_placement(order)
+            pcbnew.Refresh()
+
+        ABORT_NOTE = "「中止」を押すと、その時点のベスト配置で確定します"
+
+        best_order = None
         t0 = time.time()
-        if n <= 5:
-            # 全列挙（回転は pack 内で貪欲に選ばれる）
-            best_order = None
-            best_cost = None
-            for perm in itertools.permutations(range(n)):
-                c = cost(perm)
-                if best_cost is None or c < best_cost:
-                    best_cost = c
-                    best_order = list(perm)
-        else:
-            # 初期順の候補: 現在の並び(上→下、左→右) と 面積の大きい順
-            seeds = [
-                sorted(range(n), key=lambda i: (cur_pos[i][1], cur_pos[i][0])),
-                sorted(range(n), key=lambda i: -variants[i][0]["w"] * variants[i][0]["h"]),
-            ]
-            order = min(seeds, key=cost)
-            best_order = list(order)
-            best_cost = cur_cost = cost(order)
-            # 焼きなまし法（スワップ・挿入）で順番を最適化
-            t_start = max(best_cost * 0.05, 1.0)
-            while True:
-                elapsed = time.time() - t0
-                if elapsed > TIME_BUDGET_S:
-                    break
-                temp = t_start * (0.001 ** (elapsed / TIME_BUDGET_S))
-                a = random.randrange(n)
-                b = random.randrange(n)
-                if a == b:
-                    continue
-                if random.random() < 0.5:
-                    order[a], order[b] = order[b], order[a]
-                    undo = ("swap", a, b)
-                else:
-                    order.insert(b, order.pop(a))
-                    undo = ("ins", a, b)
-                c = cost(order)
-                if c <= cur_cost or random.random() < math.exp((cur_cost - c) / temp):
-                    cur_cost = c
-                    if c < best_cost:
+        try:
+            if n <= 5:
+                # 全列挙（回転は pack 内で貪欲に選ばれる）
+                best_cost = None
+                total = math.factorial(n)
+                for done, perm in enumerate(itertools.permutations(range(n))):
+                    if not tick(done / total,
+                                "並び順を全列挙中 %d/%d\n%s" % (done, total, ABORT_NOTE)):
+                        break
+                    c = cost(perm)
+                    if best_cost is None or c < best_cost:
                         best_cost = c
-                        best_order = list(order)
-                else:
-                    if undo[0] == "swap":
-                        order[a], order[b] = order[b], order[a]
-                    else:
-                        order.insert(a, order.pop(b))
+                        best_order = list(perm)
+                        improves[0] += 1
+                        live_update(best_order)
+            else:
+                # 初期順の候補: 現在の並び(上→下、左→右) と 面積の大きい順
+                seeds = [
+                    sorted(range(n), key=lambda i: (cur_pos[i][1], cur_pos[i][0])),
+                    sorted(range(n), key=lambda i: -variants[i][0]["w"] * variants[i][0]["h"]),
+                ]
+                order = min(seeds, key=cost)
+                best_order = list(order)
+                best_cost = cost(order)
+
+                def anneal_msg(round_no):
+                    return ("焼きなまし ラウンド%d / 改善 %d回 / 評価値 %.2f mm\n%s"
+                            % (round_no, improves[0],
+                               pcbnew.ToMM(int(best_cost)), ABORT_NOTE))
+
+                # 多スタート焼きなまし: ベスト解を揺らして再出発を繰り返し、局所解から脱出する
+                round_len = max(TIME_BUDGET_S / 8.0, 3.0)  # 1ラウンドの長さ [秒]
+                round_no = 0
+                while not cancelled[0] and time.time() - t0 < TIME_BUDGET_S:
+                    round_no += 1
+                    order = list(best_order)
+                    if round_no > 1:
+                        # ベストからランダムに数箇所入れ替えて再出発（キック）
+                        for _ in range(max(2, n // 4)):
+                            a, b = random.sample(range(n), 2)
+                            order[a], order[b] = order[b], order[a]
+                    cur_cost = cost(order)
+                    t_r0 = time.time()
+                    budget = min(round_len, TIME_BUDGET_S - (t_r0 - t0))
+                    if budget <= 0:
+                        break
+                    t_start = max(cur_cost * 0.05, 1.0)
+                    while True:
+                        elapsed = time.time() - t_r0
+                        if elapsed > budget:
+                            break
+                        if not tick((time.time() - t0) / TIME_BUDGET_S,
+                                    anneal_msg(round_no)):
+                            break
+                        temp = t_start * (0.001 ** (elapsed / budget))
+                        a = random.randrange(n)
+                        b = random.randrange(n)
+                        if a == b:
+                            continue
+                        r = random.random()
+                        if r < 0.4:
+                            order[a], order[b] = order[b], order[a]
+                            undo = ("swap", a, b)
+                        elif r < 0.7:
+                            order.insert(b, order.pop(a))
+                            undo = ("ins", a, b)
+                        else:
+                            lo, hi = min(a, b), max(a, b)
+                            order[lo:hi + 1] = reversed(order[lo:hi + 1])
+                            undo = ("rev", lo, hi)
+                        c = cost(order)
+                        if c <= cur_cost or random.random() < math.exp((cur_cost - c) / temp):
+                            cur_cost = c
+                            if c < best_cost:
+                                best_cost = c
+                                best_order = list(order)
+                                improves[0] += 1
+                                live_update(best_order)
+                        else:
+                            if undo[0] == "swap":
+                                order[undo[1]], order[undo[2]] = order[undo[2]], order[undo[1]]
+                            elif undo[0] == "ins":
+                                order.insert(undo[1], order.pop(undo[2]))
+                            else:
+                                lo, hi = undo[1], undo[2]
+                                order[lo:hi + 1] = reversed(order[lo:hi + 1])
+                # 山登り仕上げ: 全ペアのスワップ/挿入を改善が無くなるまで貪欲に適用
+                improved = True
+                while improved and not cancelled[0]:
+                    improved = False
+                    for a in range(n):
+                        if cancelled[0]:
+                            break
+                        for b in range(n):
+                            if a == b:
+                                continue
+                            if not tick(0.999,
+                                        "山登り仕上げ中（全ペアの入れ替えを検証）/ 改善 %d回\n%s"
+                                        % (improves[0], ABORT_NOTE)):
+                                break
+                            order = list(best_order)
+                            order[a], order[b] = order[b], order[a]
+                            c = cost(order)
+                            if c < best_cost:
+                                best_cost = c
+                                best_order = order
+                                improved = True
+                                improves[0] += 1
+                                live_update(best_order)
+                                continue
+                            order = list(best_order)
+                            order.insert(b, order.pop(a))
+                            c = cost(order)
+                            if c < best_cost:
+                                best_cost = c
+                                best_order = order
+                                improved = True
+                                improves[0] += 1
+                                live_update(best_order)
+        finally:
+            # 例外・中止のどちらでも進捗ダイアログを確実に閉じる
+            if progress[0] is not None:
+                progress[0].Destroy()
+                progress[0] = None
 
         # 配置を適用（配置ブロックの左上を現在の選択範囲の左上に合わせる）
-        pos, ori, _ = pack(best_order)
-        min_px = min(p[0] for p in pos)
-        min_py = min(p[1] for p in pos)
-        origin_x = min(p[0] for p in cur_pos) - min_px
-        origin_y = min(p[1] for p in cur_pos) - min_py
-        for i, fp in enumerate(fps):
-            k = ori[i]
-            v = next(v for v in variants[i] if v["k"] == k)
-            for _ in range(k):
-                fp.Rotate(fp.GetPosition(), ANGLE_90)  # 実測時と同方向に回す
-            target = pcbnew.VECTOR2I(origin_x + pos[i][0], origin_y + pos[i][1]) + v["off"]
-            fp.SetPosition(target)
-
+        if best_order is None:
+            return  # 開始直後に中止された場合は何も変えない
+        apply_placement(best_order)
         pcbnew.Refresh()
 
 MinWirePackRot().register()

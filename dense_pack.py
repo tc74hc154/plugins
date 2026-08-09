@@ -1,9 +1,15 @@
-# dense_pack.py — 選択フットプリントを、今の並び（行・列の構造と順序）を保ったまま
-# コートヤード枠線（中心線）基準でギャップ0に詰める。
-# 隣り合うコートヤードの枠線がちょうど一致する（距離0で重なる）。
+"""今の並びのまま、隙間ゼロに詰める（整列のみ・配線は見ない）
+
+選択フットプリントを、今の並び（行・列の構造と順序）を保ったまま
+コートヤード枠線（中心線）基準でギャップ0に詰める。
+隣り合うコートヤードの枠線がちょうど一致する（距離0で重なる）。
+
+最短配線などは考慮しない、単純な「隙間詰め」ツール。
+部品を意図した並びに置いてから実行すると、その並びのままギャップ0になる。"""
 import pcbnew
 
-GAP_NM = 0  # ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
+ICON = "🧱"  # パレットのカードに表示するアイコン
+GAP_NM = 0   # ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
 
 def courtyard_bbox(fp):
     """コートヤード枠線の中心線基準BBoxを返す。
@@ -44,7 +50,7 @@ class DensePack(pcbnew.ActionPlugin):
         self.name = "Dense Pack Selected (zero gap)"
         self.category = "Placement"
         self.description = "Pack selected footprints so courtyard outlines coincide, keeping current arrangement"
-        self.show_toolbar_button = True
+        self.show_toolbar_button = False  # ツールバーには pack_launcher だけを出す
 
     def Run(self):
         board = pcbnew.GetBoard()
