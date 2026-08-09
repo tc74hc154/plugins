@@ -950,6 +950,34 @@ def reduce_bends(path, obstacles, width):
     return simplify(path)
 
 
+def path_bends(pts):
+    """点列の折れ曲がり数(方向が変わる回数)。"""
+    dirs = []
+    for a, b in zip(pts, pts[1:]):
+        if a == b:
+            continue
+        dirs.append(((b[0] > a[0]) - (b[0] < a[0]),
+                     (b[1] > a[1]) - (b[1] < a[1])))
+    return sum(1 for u, v in zip(dirs, dirs[1:]) if u != v)
+
+
+def chain_pts(chain):
+    """連鎖の点列(start→end順)。"""
+    pts = [chain["start"]]
+    cur = chain["start"]
+    for _, a, b in chain["edges"]:
+        nxt = b if a == cur else a
+        pts.append(nxt)
+        cur = nxt
+    return pts
+
+
+def min_bends(s, e):
+    """2点間の45度制約下で可能な最少の折れ曲がり数(障害物なしの場合)。"""
+    dx, dy = abs(e[0] - s[0]), abs(e[1] - s[1])
+    return 0 if (dx == 0 or dy == 0 or dx == dy) else 1
+
+
 def dedust_path(pts, obstacles, width):
     """経路から吸着許容(JOIN_TOL_NM)以下の微小セグメントを除いて角を統合する。
 
@@ -985,8 +1013,10 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     contact = midspan_contact(snap, chain)  # ゴミ断片の吸収もここで行われる
     if contact:
         return None, contact
-    if chain["extra_edges"] or chain["retargeted"]:
-        # ヒゲ/ゴミ削除、または端点の中心揃えが利得なので、同長まで許容
+    cur_bends = path_bends(chain_pts(chain))
+    bend_room = cur_bends > min_bends(s, e)
+    if chain["extra_edges"] or chain["retargeted"] or bend_room:
+        # ヒゲ/ゴミ削除・中心揃え・曲げ削減が利得になり得るので、同長まで許容
         budget = chain["length"] + 1
     else:
         budget = chain["length"] - MIN_GAIN_NM
@@ -1096,7 +1126,13 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     # 曲げ削減は等長のはずだが、単調改善の不変条件は予算で再確認しておく
     best = reduced if polyline_len(reduced) < budget else path
     # 微小セグメントを自分で作らない(octiは三角不等式を満たすので長さは増えない)
-    return dedust_path(best, obstacles, width), None
+    final = dedust_path(best, obstacles, width)
+    # 採用基準: 短くなる、または(掃除・中心揃えの利得がない場合)曲げ数が減る
+    if not chain["extra_edges"] and not chain["retargeted"] \
+       and chain["length"] - polyline_len(final) <= MIN_GAIN_NM \
+       and path_bends(final) >= cur_bends:
+        return None, ("長さの改善はなく、曲げ数(%d)も減りません" % cur_bends)
+    return final, None
 
 
 def _add_seg(board, a, b, width, layer, net):
@@ -1182,12 +1218,13 @@ def shorten_board(board, clearance, avoid_courtyards,
             if lower <= 0:
                 continue
             if not c["extra_edges"] and not c["retargeted"] \
-               and c["length"] - lower <= MIN_GAIN_NM:
+               and c["length"] - lower <= MIN_GAIN_NM \
+               and path_bends(chain_pts(c)) <= min_bends(c["start"], c["end"]):
                 if reasons is not None:
                     reasons.append(_chain_desc(board, c)
                                    + ": すでに45度制約下の最短です(迂回率 %.4f)"
                                    % (c["length"] / lower))
-                continue  # ほぼ最短で、消すヒゲも中心揃えの必要も無い
+                continue  # ほぼ最短・曲げも最少で、消すヒゲも中心揃えの必要も無い
             work.append((c["length"] / lower, c))
         work.sort(key=lambda x: -x[0])
 
