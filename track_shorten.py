@@ -351,18 +351,52 @@ def _group_chains(net, layer, group, via_pts, arc_ends, pads_by_net):
     vset = {canon(p) for p in vset}
     aset = {canon(p) for p in aset}
 
+    # --- 微小セグメントの収縮: 吸着許容(JOIN_TOL_NM)以下の長さしかない
+    #     セグメントは「点」として扱い、両端ノードを1つに統合する。
+    #     微小断片が偽の分岐点や幅混在を作って連鎖を細切れにするのを防ぐ。
+    #     代表点は動かせない点(パッド中心 > ビア/円弧端)を優先して残す
+    pad_center_pts = {center for _, center, _ in pad_geo}
+    cparent = {}
+
+    def cfind(x):
+        while cparent.get(x, x) != x:
+            cparent[x] = cparent.get(cparent[x], cparent[x])
+            x = cparent[x]
+        return x
+
+    def _node_prio(x):
+        return (x in pad_center_pts, x in vset or x in aset, x)
+
+    for t in group:
+        a0, b0 = canon(_pt(t.GetStart())), canon(_pt(t.GetEnd()))
+        if a0 == b0 or octi(a0, b0) > JOIN_TOL_NM:
+            continue
+        ra, rb = cfind(a0), cfind(b0)
+        if ra == rb:
+            continue
+        keep, drop = (ra, rb) if _node_prio(ra) >= _node_prio(rb) else (rb, ra)
+        cparent[drop] = keep
+
+    def cn(p):
+        return cfind(canon(p))
+
+    vset = {cfind(p) for p in vset}
+    aset = {cfind(p) for p in aset}
+
     # --- 論理分割: セグメント途中のセンターライン上に乗っている
     #     同ネットのトラック端点・ビア・パッド中心で切る
-    cand = {canon(p) for p in raw_pts}
+    cand = {cn(p) for p in raw_pts}
 
     track_edges = {}   # uid -> [(a, b), ...] そのトラックの全サブ辺
     group_nodes = {}   # uid -> (端点+分割点, ...)
     phys_at = {}       # (uid, 代表点) -> 物理端点(中心寄せ等でズレた場合)
     fillers = {}       # 代表点 -> [(track, 物理a, 物理b)] 潰れた実セグメント
     edges = []         # (track, a, b)
+    edge_seen = set()  # 無向キー: 同じ2点間の平行(重複)エッジ検出用
+    dup_edges = {}     # 無向キー -> [(track, a, b)] 代表以外の重複エッジ
     for t in group:
         pa, pb = _pt(t.GetStart()), _pt(t.GetEnd())
-        a, b = canon(pa), canon(pb)
+        a, b = cn(pa), cn(pb)
         uid = _uid(t)
         if a != pa:
             phys_at[(uid, a)] = pa
@@ -393,7 +427,14 @@ def _group_chains(net, layer, group, via_pts, arc_ends, pads_by_net):
         track_edges[uid] = [(u, v) for u, v in zip(seq, seq[1:]) if u != v]
         group_nodes[uid] = tuple(seq)
         for u, v in track_edges[uid]:
-            edges.append((t, u, v))
+            # 同じ2点間の平行エッジは代表1本だけをグラフに載せる。
+            # 重なった配線が次数を膨らませて偽の分岐点になるのを防ぐ
+            key = (u, v) if u <= v else (v, u)
+            if key in edge_seen:
+                dup_edges.setdefault(key, []).append((t, u, v))
+            else:
+                edge_seen.add(key)
+                edges.append((t, u, v))
 
     def build_graph(edge_list):
         adj = {}
@@ -531,6 +572,44 @@ def _group_chains(net, layer, group, via_pts, arc_ends, pads_by_net):
             ch["extra_edges"].extend(es)
             for t, _, _ in es:
                 ch["tracks"][_uid(t)] = t
+
+    # 重複エッジは、代表エッジを含む連鎖に併合して引き直しと一緒に削除する
+    if dup_edges:
+        edge_chain = {}
+        for ci, ch in enumerate(chains):
+            for _, u, v in ch["edges"]:
+                edge_chain[(u, v) if u <= v else (v, u)] = ci
+        for key, dups in dup_edges.items():
+            ci = edge_chain.get(key)
+            if ci is None:
+                continue
+            ch = chains[ci]
+            ch["extra_edges"].extend(dups)
+            for t, _, _ in dups:
+                ch["tracks"][_uid(t)] = t
+
+    # 潰れた断片(収縮した微小セグメント等)は、そのノードを通る非skipの
+    # 連鎖に併合して引き直しと一緒に削除する。ノードには吸着許容以下の
+    # 幅ズレしか無いので、連鎖の新経路がノードを通れば接続は保たれる
+    node_chain = {}
+    for ci, ch in enumerate(chains):
+        if ch["skip"]:
+            continue
+        for p in (ch["start"], ch["end"]):
+            node_chain.setdefault(p, ci)
+    for node, fl in fillers.items():
+        ci = interior.get(node)
+        if ci is None or chains[ci]["skip"]:
+            ci = node_chain.get(node)
+        if ci is None:
+            continue
+        ch = chains[ci]
+        for f in fl:
+            if _uid(f[0]) in claimed_fillers:
+                continue
+            claimed_fillers.add(_uid(f[0]))
+            ch["extra_edges"].append(f)
+            ch["tracks"][_uid(f[0])] = f[0]
     return chains
 
 
@@ -871,6 +950,30 @@ def reduce_bends(path, obstacles, width):
     return simplify(path)
 
 
+def dedust_path(pts, obstacles, width):
+    """経路から吸着許容(JOIN_TOL_NM)以下の微小セグメントを除いて角を統合する。
+
+    微小セグメントを盤上に作ると、次回実行時の連鎖構築で偽の分岐点の
+    種になる。統合した区間は全障害物に対して再検証し、通らなければ元のまま。
+    統合で線が厳密な45度からズレることがあるが、ズレ幅は吸着許容以下。
+    """
+    if len(pts) < 3:
+        return pts
+    out = [pts[0]]
+    for p in pts[1:-1]:
+        if octi(out[-1], p) > JOIN_TOL_NM:
+            out.append(p)
+    # 終端の直前に微小セグメントが残る場合は中間点の方を捨てる(端点は不動)
+    if len(out) > 1 and octi(out[-1], pts[-1]) <= JOIN_TOL_NM:
+        out.pop()
+    out.append(pts[-1])
+    if len(out) == len(pts) or len(out) < 2:
+        return pts
+    if not all(seg_ok(a, b, obstacles, width) for a, b in zip(out, out[1:])):
+        return pts
+    return out
+
+
 def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     """(新経路の点列 or None, 不成立理由 or None) を返す。
 
@@ -991,7 +1094,9 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     # 曲げ削減の張り直しは全障害物に対して検証する
     reduced = reduce_bends(path, obstacles, width)
     # 曲げ削減は等長のはずだが、単調改善の不変条件は予算で再確認しておく
-    return (reduced if polyline_len(reduced) < budget else path), None
+    best = reduced if polyline_len(reduced) < budget else path
+    # 微小セグメントを自分で作らない(octiは三角不等式を満たすので長さは増えない)
+    return dedust_path(best, obstacles, width), None
 
 
 def _add_seg(board, a, b, width, layer, net):
