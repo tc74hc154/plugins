@@ -17,7 +17,9 @@
 - 経路は45度制約(水平/垂直/斜め)。障害物の角を結ぶ可視グラフ+A*で
   探索する連続空間方式なので、グリッドに依存しない
 - 他ネットの配線・ビア・パッド・基板外形(Edge.Cuts)とはクリアランスを
-  保つ(衝突判定はKiCad自身のエンジンを使用)
+  保つ(衝突判定はKiCad自身のエンジンを使用)。クリアランスは相手ごとに
+  「自ネットのルール値」と「相手のルール値」の大きい方を適用する
+  (ネットクラス/ローカル上書き対応。ダイアログの値は下限)
 - 「部品の下も通る」を外すとコートヤードも障害物になる
 - 今より厳密に短くなり、かつ無衝突のときだけ置き換える。全体を何周か
   繰り返し、改善が無くなった周で自動終了(1本の短縮が別の配線の
@@ -150,6 +152,8 @@ def snapshot(board):
     for _ in range(3):
         try:
             return {
+                "board": board,
+                "net_clr": {},  # ネットコード -> ネットクラス由来クリアランス
                 "tracks": list(board.GetTracks()),
                 "pads": list(board.GetPads()),
                 "footprints": list(board.GetFootprints()),
@@ -161,6 +165,54 @@ def snapshot(board):
             last = exc
             time.sleep(0.05)
     raise last
+
+
+def _net_clearance(snap, netcode):
+    """ネットクラス(プロジェクトルール)由来のクリアランス。"""
+    cache = snap["net_clr"]
+    if netcode in cache:
+        return cache[netcode]
+    c = 0
+    board = snap["board"]
+    try:
+        ncs = board.GetAllNetClasses()
+        try:
+            c = ncs[board.FindNet(netcode).GetNetClassName()].GetClearance()
+        except Exception:
+            c = ncs["Default"].GetClearance()
+    except Exception:
+        c = 0
+    cache[netcode] = c
+    return c
+
+
+def _item_clearance(snap, item, layer):
+    """アイテムの解決済みクリアランス。
+
+    ネットクラス値・ローカル上書き・KiCadエンジンの解決値(GUIでは
+    カスタムDRCルールも反映される。ヘッドレスでは0を返す)の最大。
+    """
+    c = _net_clearance(snap, item.GetNetCode())
+    try:
+        own = item.GetOwnClearance(layer)
+        if own and own > c:
+            c = own
+    except Exception:
+        pass
+    try:
+        lc = item.GetLocalClearance()
+        if lc and lc > c:
+            c = lc
+    except Exception:
+        pass
+    return c
+
+
+def chain_base_clearance(snap, chain, floor_clr):
+    """連鎖自身のネットに適用されるクリアランス(ダイアログ値を下限とする)。"""
+    for t in chain["tracks"].values():
+        return max(floor_clr, _item_clearance(snap, t, chain["layer"]))
+    return floor_clr
 
 
 # ---------------------------------------------------------------- 連鎖(コネクション)抽出
@@ -609,44 +661,78 @@ def _courtyard_layers(layer):
     return [pcbnew.F_CrtYd, pcbnew.B_CrtYd]
 
 
-def collect_obstacles(snap, chain, clearance, avoid_courtyards, region,
+def collect_obstacles(snap, chain, base_clr, avoid_courtyards, region,
                       planned_obs=()):
-    """(shape, bboxタプル) のリスト。同ネットは障害物にしない(接触しても短絡しない)。
+    """(shape, bboxタプル, クリアランス) のリスト。同ネットは障害物にしない。
 
-    planned_obs はこの周でまだ基板に反映していない計画済み新経路
-    (net, layer, shape, bboxタプル)。他ネットの計画とも衝突しないようにする。
+    クリアランスは障害物ごとに「自ネット側の値」と「相手側の値」の大きい方
+    (KiCadの基本ルール解決と同じ)。base_clr は連鎖側の値(ダイアログ下限込み)。
+    planned_obs はこの周で計画済みの新経路 (net, layer, shape, bbox, clr)。
     """
     net, layer = chain["net"], chain["layer"]
     rl, rt, rr, rb = region
     obs = []
-    for pnet, player, shape, bb in planned_obs:
+    for pnet, player, shape, bb, pclr in planned_obs:
         if pnet == net or player != layer:
             continue
         if bb[2] < rl or bb[0] > rr or bb[3] < rt or bb[1] > rb:
             continue
-        obs.append((shape, bb))
+        obs.append((shape, bb, max(base_clr, pclr)))
 
-    def add(shape, bb):
+    def add(shape, bb, clr):
         t_ = (bb.GetLeft(), bb.GetTop(), bb.GetRight(), bb.GetBottom())
         if t_[2] < rl or t_[0] > rr or t_[3] < rt or t_[1] > rb:
             return
-        obs.append((shape, t_))
+        obs.append((shape, t_, clr))
+
+    hole_clr = 0
+    try:  # 基板セットアップの「穴-銅」クリアランス(銅ルールとは別の制約)
+        hole_clr = snap["board"].GetDesignSettings().m_HoleClearance
+    except Exception:
+        pass
+
+    def add_hole(pos, dia):
+        """ドリル穴を独立した障害物として追加(ホールクリアランス適用)。"""
+        if dia <= 0 or hole_clr <= 0:
+            return
+        r = dia // 2
+        shape = pcbnew.SHAPE_SEGMENT(pos, pos, dia)
+        t_ = (pos.x - r, pos.y - r, pos.x + r, pos.y + r)
+        if t_[2] < rl or t_[0] > rr or t_[3] < rt or t_[1] > rb:
+            return
+        obs.append((shape, t_, hole_clr))
 
     for t in snap["tracks"]:
         if t.GetNetCode() == net or not t.IsOnLayer(layer):
             continue
-        add(t.GetEffectiveShape(layer), t.GetBoundingBox())
+        add(t.GetEffectiveShape(layer), t.GetBoundingBox(),
+            max(base_clr, _item_clearance(snap, t, layer)))
+        if t.GetClass() == "PCB_VIA":
+            add_hole(t.GetPosition(), t.GetDrillValue())
     for p in snap["pads"]:
-        if p.GetNetCode() != net and p.IsOnLayer(layer):
-            add(p.GetEffectiveShape(layer), p.GetBoundingBox())
+        if p.GetNetCode() == net:
+            continue
+        if p.IsOnLayer(layer):
+            add(p.GetEffectiveShape(layer), p.GetBoundingBox(),
+                max(base_clr, _item_clearance(snap, p, layer)))
+        # NPTH(銅なし穴)や層違いのスルーホールも、穴自体は避ける必要がある
+        d = p.GetDrillSize()
+        add_hole(p.GetPosition(), max(d.x, d.y))
     if avoid_courtyards:
         for fp in snap["footprints"]:
             for cl in _courtyard_layers(layer):
                 poly = fp.GetCourtyard(cl)
                 if poly.OutlineCount():
-                    add(poly, poly.BBox())
+                    add(poly, poly.BBox(), base_clr)
+    edge_clr = base_clr
+    try:  # 基板外形は銅-エッジクリアランス設定も尊重する
+        ec = snap["board"].GetDesignSettings().m_CopperEdgeClearance
+        if ec and ec > edge_clr:
+            edge_clr = ec
+    except Exception:
+        pass
     for d in snap["edges"]:
-        add(d.GetEffectiveShape(), d.GetBoundingBox())
+        add(d.GetEffectiveShape(), d.GetBoundingBox(), edge_clr)
     # 配線禁止のルールエリア(キープアウト)は避ける。銅ベタは障害物にしない
     # (ベタは塗り直し時に配線を避けて充填されるので、横切ってもDRC違反にならない)
     for z in snap["zones"]:
@@ -654,32 +740,33 @@ def collect_obstacles(snap, chain, clearance, avoid_courtyards, region,
             if not (z.GetIsRuleArea() and z.GetDoNotAllowTracks()
                     and z.IsOnLayer(layer)):
                 continue
-            add(z.Outline(), z.GetBoundingBox())
+            add(z.Outline(), z.GetBoundingBox(), base_clr)
         except Exception:
             continue
     return obs
 
 
-def seg_ok(a, b, obstacles, width, clearance):
+def seg_ok(a, b, obstacles, width):
+    """セグメントが全障害物と各々のクリアランスを保てるか。"""
     if a == b:
         return True
-    half = width // 2 + clearance
+    half = width // 2
     sl = min(a[0], b[0]) - half
     sr = max(a[0], b[0]) + half
     st = min(a[1], b[1]) - half
     sb = max(a[1], b[1]) + half
     shape = None
-    for oshape, (l, t, r, btm) in obstacles:
-        if sl > r or sr < l or st > btm or sb < t:
+    for oshape, (l, t, r, btm), oc in obstacles:
+        if sl > r + oc or sr < l - oc or st > btm + oc or sb < t - oc:
             continue
         if shape is None:  # 生成は必要になった時だけ
             shape = pcbnew.SHAPE_SEGMENT(V(a[0], a[1]), V(b[0], b[1]), width)
-        if oshape.Collide(shape, clearance):
+        if oshape.Collide(shape, oc):
             return False
     return True
 
 
-def find_path(s, e, corner_nodes, obstacles, width, clearance, budget,
+def find_path(s, e, corner_nodes, obstacles, width, budget,
               deadline=None):
     """可視グラフ上のA*。(長さ<budgetの45度経路 or None, 時間切れか) を返す。
 
@@ -698,7 +785,7 @@ def find_path(s, e, corner_nodes, obstacles, width, clearance, budget,
             res = None
             for bends in bend_candidates(a, b):
                 way = [a] + bends + [b]
-                if all(seg_ok(way[k], way[k + 1], obstacles, width, clearance)
+                if all(seg_ok(way[k], way[k + 1], obstacles, width)
                        for k in range(len(way) - 1)):
                     res = bends
                     break
@@ -750,7 +837,7 @@ def find_path(s, e, corner_nodes, obstacles, width, clearance, budget,
     return simplify(out), timed_out
 
 
-def reduce_bends(path, obstacles, width, clearance):
+def reduce_bends(path, obstacles, width):
     """長さを増やさずに曲げ回数を減らす。
 
     A*は等長の最短経路をどれでも返し得るので、部分区間を「曲げ1回以下の
@@ -774,8 +861,7 @@ def reduce_bends(path, obstacles, width, clearance):
                     if len(bends) >= j - i - 1:
                         continue
                     way = [path[i]] + bends + [path[j]]
-                    if all(seg_ok(way[k], way[k + 1], obstacles,
-                                  width, clearance)
+                    if all(seg_ok(way[k], way[k + 1], obstacles, width)
                            for k in range(len(way) - 1)):
                         path = path[:i + 1] + bends + path[j:]
                         changed = True
@@ -808,12 +894,13 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
         return None, ("すでに45度制約下の最短です(迂回率 %.4f)"
                       % (chain["length"] / lower))
 
+    base_clr = chain_base_clearance(snap, chain, clearance)
     # 改善経路は octi(s,p)+octi(p,e) <= 現在長 の領域から出ない
-    slack = int((chain["length"] - lower) / 2) + clearance + chain["width"] \
+    slack = int((chain["length"] - lower) / 2) + base_clr + chain["width"] \
         + pcbnew.FromMM(1)
     region = (min(s[0], e[0]) - slack, min(s[1], e[1]) - slack,
               max(s[0], e[0]) + slack, max(s[1], e[1]) + slack)
-    obstacles = collect_obstacles(snap, chain, clearance,
+    obstacles = collect_obstacles(snap, chain, base_clr,
                                   avoid_courtyards, region, planned_obs)
 
     # --- 遅延障害物方式: まず障害物なしで最短を引き、その経路に実際に
@@ -823,14 +910,13 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     #     ・採用経路は毎回「全障害物」に対して検証するので安全
     #     ノードが「実際に邪魔な障害物の角」だけになり、密集地帯でも
     #     ノード上限に達しにくい
-    infl = clearance + chain["width"] // 2 + NODE_MARGIN_NM
     width = chain["width"]
-    half = width // 2 + clearance
     deadline = time.time() + SEARCH_TIME_S
 
     def corners_from(obs_list):
         corners = []
-        for _, (l, t, r, b) in obs_list:
+        for _, (l, t, r, b), oc in obs_list:
+            infl = oc + width // 2 + NODE_MARGIN_NM
             for c in ((l - infl, t - infl), (r + infl, t - infl),
                       (r + infl, b + infl), (l - infl, b + infl)):
                 d = octi(s, c) + octi(c, e)
@@ -857,13 +943,14 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     truncated = False
     timed_out = False
     path = None
+    half = width // 2
     for _ in range(len(obstacles) + 1):
         nodes, truncated = corners_from(active)
         path, timed_out = find_path(s, e, nodes, active, width,
-                                    clearance, budget, deadline=deadline)
+                                    budget, deadline=deadline)
         if path is None:
             break
-        # 全障害物に対して検証し、当たったものを探索対象に足す
+        # 全障害物に対して(それぞれのクリアランスで)検証し、当たったものを足す
         seg_shapes = []
         for a, b in zip(path, path[1:]):
             seg_shapes.append(
@@ -871,13 +958,13 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
                  (min(a[0], b[0]) - half, min(a[1], b[1]) - half,
                   max(a[0], b[0]) + half, max(a[1], b[1]) + half)))
         violators = []
-        for i, (oshape, (l, t, r, b)) in enumerate(obstacles):
+        for i, (oshape, (l, t, r, b), oc) in enumerate(obstacles):
             if i in active_idx:
                 continue
             for sshape, (sl, st, sr, sb) in seg_shapes:
-                if sl > r or sr < l or st > b or sb < t:
+                if sl > r + oc or sr < l - oc or st > b + oc or sb < t - oc:
                     continue
-                if oshape.Collide(sshape, clearance):
+                if oshape.Collide(sshape, oc):
                     violators.append(i)
                     break
         if not violators:
@@ -902,7 +989,7 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
                     "見落としの可能性があります" % MAX_NODES)
         return None, why
     # 曲げ削減の張り直しは全障害物に対して検証する
-    reduced = reduce_bends(path, obstacles, width, clearance)
+    reduced = reduce_bends(path, obstacles, width)
     # 曲げ削減は等長のはずだが、単調改善の不変条件は予算で再確認しておく
     return (reduced if polyline_len(reduced) < budget else path), None
 
@@ -1028,11 +1115,13 @@ def shorten_board(board, clearance, avoid_courtyards,
             used.update(c["tracks"])
             w = c["width"]
             half = w // 2
+            c_clr = chain_base_clearance(snap, c, clearance)
             for a, b in zip(pts, pts[1:]):
                 bb = (min(a[0], b[0]) - half, min(a[1], b[1]) - half,
                       max(a[0], b[0]) + half, max(a[1], b[1]) + half)
                 planned_obs.append((c["net"], c["layer"],
-                                    pcbnew.SHAPE_SEGMENT(V(*a), V(*b), w), bb))
+                                    pcbnew.SHAPE_SEGMENT(V(*a), V(*b), w),
+                                    bb, c_clr))
             improved += 1
             replaced += 1
 
@@ -1115,7 +1204,8 @@ if wx is not None:
                      0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(wx.StaticText(self, label=target), 0)
 
-            grid.Add(wx.StaticText(self, label="クリアランス [mm]"),
+            # 実際の間隔はネットクラス等のルール解決値と、この下限の大きい方
+            grid.Add(wx.StaticText(self, label="クリアランス下限 [mm]"),
                      0, wx.ALIGN_CENTER_VERTICAL)
             self.clearance = wx.SpinCtrlDouble(
                 self, min=0.05, max=5.0,
