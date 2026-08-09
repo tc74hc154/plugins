@@ -38,7 +38,8 @@ from bisect import bisect_left, bisect_right
 import pcbnew
 import wx
 
-ICON = "🧱"  # パレットのカードに表示するアイコン
+ICON = "🧱"  # パレットのタイルに表示するアイコン
+LABEL = "隙間ゼロに詰める"  # パレットのタイルに表示する短い名前
 GAP_NM = 0   # ブロック間ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
 TOUCH_TOL_NM = 1000  # コートヤードが「接している」とみなす距離の許容 [nm]
 
@@ -51,6 +52,19 @@ ALIGN_Y = {"top": 0.0, "middle": 0.5, "bottom": 1.0}   # 行内の縦揃え
 LAST_ALIGN = ["center", "middle"]  # セッション内で最後に選んだボタンを覚える
 LAST_WIRES = [True]                # 「配線も動かす」チェックの前回値
 LAST_SHORTEN = [True]              # 「仕上げに短縮」チェックの前回値
+
+PRESET = None  # パレットが実行直前に渡すパラメータ(Run()が消費、無ければダイアログ)
+
+
+def PANEL():
+    """パレット埋め込みUIの定義(pack_launcher が参照。規約はREADME)。"""
+    return [
+        {"type": "dirgrid", "key": "align", "last": list(LAST_ALIGN)},
+        {"type": "check", "key": "wires",
+         "label": "パッドにつながる配線も動かす", "default": LAST_WIRES[0]},
+        {"type": "check", "key": "shorten",
+         "label": "仕上げに配線を短縮", "default": LAST_SHORTEN[0]},
+    ]
 
 def courtyard_bbox(fp):
     """コートヤード枠線の中心線基準BBoxを返す。
@@ -1175,19 +1189,28 @@ class DensePack(pcbnew.ActionPlugin):
         self.show_toolbar_button = False  # ツールバーには pack_launcher だけを出す
 
     def Run(self):
+        global PRESET
+        preset, PRESET = PRESET, None
         board = pcbnew.GetBoard()
-        if not any(fp.IsSelected() for fp in board.GetFootprints()):
-            return
         parent = wx.FindWindowByName("PcbFrame")
-        dlg = AlignPackDialog(parent, LAST_ALIGN)
-        try:
-            if dlg.ShowModal() != wx.ID_OK or dlg.choice is None:
-                return  # ×/Escは何もしない
-            align_x, align_y = dlg.choice
-            move_wires = dlg.cb_wires.GetValue()
-            do_shorten = dlg.cb_shorten.GetValue()
-        finally:
-            dlg.Destroy()
+        if not any(fp.IsSelected() for fp in board.GetFootprints()):
+            wx.MessageBox("先に詰めたいフットプリントを選択してください。",
+                          "整列して詰める", wx.OK | wx.ICON_INFORMATION, parent)
+            return
+        if preset:  # パレットから: パラメータ指定済みなのでダイアログを出さない
+            align_x, align_y = preset.get("align") or LAST_ALIGN
+            move_wires = bool(preset.get("wires", LAST_WIRES[0]))
+            do_shorten = bool(preset.get("shorten", LAST_SHORTEN[0]))
+        else:  # メニューから直接: 従来の3x3ダイアログ
+            dlg = AlignPackDialog(parent, LAST_ALIGN)
+            try:
+                if dlg.ShowModal() != wx.ID_OK or dlg.choice is None:
+                    return  # ×/Escは何もしない
+                align_x, align_y = dlg.choice
+                move_wires = dlg.cb_wires.GetValue()
+                do_shorten = dlg.cb_shorten.GetValue()
+            finally:
+                dlg.Destroy()
         LAST_ALIGN[:] = [align_x, align_y]
         LAST_WIRES[0] = move_wires
         LAST_SHORTEN[0] = do_shorten

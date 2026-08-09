@@ -22,7 +22,12 @@ try:
 except ImportError:
     wx = None
 
-ICON = "🔄"           # パレットのカードに表示するアイコン
+ICON = "🔄"           # パレットのタイルに表示するアイコン
+LABEL = "配線最短で詰める"  # パレットのタイルに表示する短い名前
+
+PANEL = [  # パレット埋め込みUIの定義(パラメータなし、実行ボタンのみ)
+    {"type": "run", "label": "実行"},
+]
 GAP_NM = 0            # 部品間ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
 TIME_BUDGET_S = 60.0  # 最適化に使う時間 [秒]。増やすほど良い解になりやすい
 MAX_ROW_WIDTH_MM = 0  # 配置ブロックの最大幅 [mm]。0なら全体が正方形に近づくよう自動設定
@@ -113,6 +118,11 @@ class MinWirePackRot(pcbnew.ActionPlugin):
         board = pcbnew.GetBoard()
         fps = [fp for fp in board.GetFootprints() if fp.IsSelected()]
         if len(fps) < 2:
+            if wx is not None:
+                wx.MessageBox("先に詰めたいフットプリントを2つ以上選択してください。",
+                              "配線最短で詰める",
+                              wx.OK | wx.ICON_INFORMATION,
+                              wx.FindWindowByName("PcbFrame"))
             return
 
         n = len(fps)

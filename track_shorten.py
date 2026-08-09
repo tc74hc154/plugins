@@ -43,6 +43,26 @@ except ImportError:
     wx = None
 
 ICON = "✂️"
+LABEL = "配線を短縮"  # パレットのタイルに表示する短い名前
+
+PRESET = None  # パレットが実行直前に渡すパラメータ(Run()が消費、無ければダイアログ)
+
+
+def PANEL():
+    """パレット埋め込みUIの定義(pack_launcher が参照。規約はREADME)。"""
+    try:
+        clr = round(pcbnew.ToMM(default_clearance(pcbnew.GetBoard())), 2)
+    except Exception:
+        clr = DEFAULT_CLEARANCE_MM
+    return [
+        {"type": "number", "key": "clearance", "label": "クリアランス下限",
+         "unit": "mm", "default": clr, "min": 0.05, "max": 5.0, "step": 0.05},
+        {"type": "number", "key": "passes", "label": "最大周回数",
+         "default": DEFAULT_MAX_PASSES, "min": 1, "max": 20, "step": 1},
+        {"type": "check", "key": "under", "label": "部品の下も通る",
+         "default": True},
+        {"type": "run", "label": "短縮"},
+    ]
 DEFAULT_MAX_PASSES = 5
 DEFAULT_CLEARANCE_MM = 0.2  # ネットクラスから取れないときの既定値
 MIN_GAIN_NM = 1000          # これ(1µm)以上縮まないなら置き換えない
@@ -1474,13 +1494,23 @@ class TrackShorten(pcbnew.ActionPlugin):
                           "配線を最短化", wx.OK | wx.ICON_INFORMATION, parent)
             return
 
-        dlg = TrackShortenDialog(parent, board, len(sel))
-        try:
-            if dlg.ShowModal() != wx.ID_OK:
-                return
-            params = dlg.get_params()
-        finally:
-            dlg.Destroy()
+        global PRESET
+        preset, PRESET = PRESET, None
+        if preset:  # パレットから: パラメータ指定済みなのでダイアログを出さない
+            params = {
+                "clearance": pcbnew.FromMM(
+                    float(preset.get("clearance", DEFAULT_CLEARANCE_MM))),
+                "avoid_courtyards": not preset.get("under", True),
+                "max_passes": int(preset.get("passes", DEFAULT_MAX_PASSES)),
+            }
+        else:  # メニューから直接: 従来の設定ダイアログ
+            dlg = TrackShortenDialog(parent, board, len(sel))
+            try:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return
+                params = dlg.get_params()
+            finally:
+                dlg.Destroy()
 
         # 削除対象がGUIの選択に残ったまま Remove するとクラッシュし得るため、
         # 実行前に選択を解除して画面に反映しておく(罠#1対策)

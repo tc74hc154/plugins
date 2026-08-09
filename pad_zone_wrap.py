@@ -21,10 +21,28 @@ try:
 except ImportError:
     wx = None
 
-ICON = "🟩"                 # パレットのカードに表示するアイコン
+ICON = "🟩"                 # パレットのタイルに表示するアイコン
+LABEL = "ベタで囲む"        # パレットのタイルに表示する短い名前
+
 DEFAULT_MARGIN_MM = 1.0     # パッド外形→ベタ縁の余白（サーマルギャップより広くしておく）
 DEFAULT_CLEARANCE_MM = 0.3  # 他ネットとのクリアランス
 DEFAULT_MIN_W_MM = 0.2      # 最小幅（これより細い銅は塗られない）
+
+PRESET = None  # パレットが実行直前に渡すパラメータ(Run()が消費、無ければダイアログ)
+
+PANEL = [  # パレット埋め込みUIの定義(pack_launcher が参照。規約はREADME)
+    {"type": "number", "key": "margin", "label": "余白", "unit": "mm",
+     "default": DEFAULT_MARGIN_MM, "min": 0.0, "max": 10.0, "step": 0.1},
+    {"type": "number", "key": "clearance", "label": "クリアランス", "unit": "mm",
+     "default": DEFAULT_CLEARANCE_MM, "min": 0.0, "max": 10.0, "step": 0.1},
+    {"type": "number", "key": "min_w", "label": "最小幅", "unit": "mm",
+     "default": DEFAULT_MIN_W_MM, "min": 0.0, "max": 10.0, "step": 0.1},
+    {"type": "choice", "key": "conn", "label": "パッド接続",
+     "options": ["サーマルリリーフ", "ベタ直結"], "default": 0},
+    {"type": "check", "key": "fill", "label": "作成後に塗りつぶす",
+     "default": True},
+    {"type": "run", "label": "作成"},
+]
 
 
 def collect_selected_pads(board):
@@ -214,13 +232,36 @@ class PadZoneWrap(pcbnew.ActionPlugin):
                           "パッドをベタで囲む", wx.OK | wx.ICON_INFORMATION, parent)
             return
 
-        dlg = PadZoneDialog(parent, board, pads)
-        try:
-            if dlg.ShowModal() != wx.ID_OK:
-                return
-            params = dlg.get_params()
-        finally:
-            dlg.Destroy()
+        global PRESET
+        preset, PRESET = PRESET, None
+        nets = unique_netnames(pads)
+        if preset and len(nets) <= 1:
+            # パレットから: ネットが一意ならダイアログなしで作成。
+            # 層は選択パッドが載っている銅箔層(ダイアログの初期値と同じ)
+            net = board.FindNet(nets[0]) if nets else None
+            params = {
+                "layers": [l for l in board.GetEnabledLayers().CuStack()
+                           if any(p.IsOnLayer(l) for p in pads)],
+                "netcode": net.GetNetCode() if net else 0,
+                "margin_nm": pcbnew.FromMM(
+                    float(preset.get("margin", DEFAULT_MARGIN_MM))),
+                "clearance_nm": pcbnew.FromMM(
+                    float(preset.get("clearance", DEFAULT_CLEARANCE_MM))),
+                "min_w_nm": pcbnew.FromMM(
+                    float(preset.get("min_w", DEFAULT_MIN_W_MM))),
+                "thermal": int(preset.get("conn", 0)) == 0,
+                "fill": bool(preset.get("fill", True)),
+            }
+        else:
+            # メニューから直接、または複数ネット選択(どのネットで囲むか
+            # 選ぶ必要がある)のときは従来の設定ダイアログ
+            dlg = PadZoneDialog(parent, board, pads)
+            try:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return
+                params = dlg.get_params()
+            finally:
+                dlg.Destroy()
 
         if not params["layers"]:
             wx.MessageBox("層が1つも選ばれていません。", "パッドをベタで囲む",
