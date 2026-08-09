@@ -1002,6 +1002,95 @@ def dedust_path(pts, obstacles, width):
     return out
 
 
+def _seg_geom(shape):
+    """SHAPE_SEGMENTなら((ax,ay),(bx,by))、それ以外はNone。"""
+    try:
+        if isinstance(shape, pcbnew.SHAPE_SEGMENT):
+            sg = shape.GetSeg()
+            return ((sg.A.x, sg.A.y), (sg.B.x, sg.B.y))
+    except Exception:
+        pass
+    return None
+
+
+def _hug_nodes(geom, r, refs):
+    """線分(スタジアム)障害物の実形状に沿ったノード候補。
+
+    端点まわりの8方向リングと、参照点(端子・他の障害物の端点)から
+    線分への垂線の足±法線方向。長い配線や45度配線のBBox角は実形状から
+    遠く、壁に沿って隙間を通る経路のノードにならないための補完。
+    r は中心線からノードまでの距離(障害物半幅+クリアランス+自幅/2+余白)。
+    """
+    (ax, ay), (bx, by) = geom
+    out = []
+    ends = ((ax, ay),) if (ax, ay) == (bx, by) else ((ax, ay), (bx, by))
+    for px, py in ends:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            k = r / math.hypot(dx, dy)
+            out.append((int(px + dx * k), int(py + dy * k)))
+    vx, vy = bx - ax, by - ay
+    l2 = vx * vx + vy * vy
+    if l2:
+        n = math.sqrt(l2)
+        nx, ny = -vy / n, vx / n
+        for q in refs:
+            t = ((q[0] - ax) * vx + (q[1] - ay) * vy) / l2
+            if t <= 0.0 or t >= 1.0:
+                continue  # 端点側はリングが受け持つ
+            fx, fy = ax + vx * t, ay + vy * t
+            out.append((int(fx + nx * r), int(fy + ny * r)))
+            out.append((int(fx - nx * r), int(fy - ny * r)))
+    return out
+
+
+def corner_candidates(obs_list, width, s, e, budget):
+    """遅延障害物集合から探索ノードを作る。
+
+    BBoxの角に加え、線分障害物には実形状に沿ったノード(端点リング+
+    端子や他障害物の端点からの垂線の足)を足す。参照点方式なので、
+    2本の長い配線に挟まれたチャネルの通過点も生成される。
+    """
+    refs = [s, e]
+    geos = []
+    for shape, _, _ in obs_list:
+        g = _seg_geom(shape)
+        geos.append(g)
+        if g:
+            refs.append(g[0])
+            refs.append(g[1])
+    corners = []
+    for (shape, (l, t, r, b), oc), g in zip(obs_list, geos):
+        infl = oc + width // 2 + NODE_MARGIN_NM
+        cands = [(l - infl, t - infl), (r + infl, t - infl),
+                 (r + infl, b + infl), (l - infl, b + infl)]
+        if g is not None:
+            try:
+                half_w = shape.GetWidth() // 2
+            except Exception:
+                half_w = 0
+            cands += _hug_nodes(g, half_w + infl, refs)
+        for c in cands:
+            d = octi(s, c) + octi(c, e)
+            if d < budget:
+                corners.append((d, c))
+    corners.sort(key=lambda x: x[0])
+    # 近接ノードを間引いてから上限を適用(パッド列は角が重なりがち)
+    nodes = []
+    seen = set()
+    cut = False
+    for _, c in corners:
+        key = (c[0] // NODE_DEDUP_NM, c[1] // NODE_DEDUP_NM)
+        if key in seen:
+            continue
+        if len(nodes) >= MAX_NODES:
+            cut = True
+            break
+        seen.add(key)
+        nodes.append(c)
+    return nodes, cut
+
+
 def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     """(新経路の点列 or None, 不成立理由 or None) を返す。
 
@@ -1047,29 +1136,7 @@ def shorten_chain(snap, chain, clearance, avoid_courtyards, planned_obs=()):
     deadline = time.time() + SEARCH_TIME_S
 
     def corners_from(obs_list):
-        corners = []
-        for _, (l, t, r, b), oc in obs_list:
-            infl = oc + width // 2 + NODE_MARGIN_NM
-            for c in ((l - infl, t - infl), (r + infl, t - infl),
-                      (r + infl, b + infl), (l - infl, b + infl)):
-                d = octi(s, c) + octi(c, e)
-                if d < budget:
-                    corners.append((d, c))
-        corners.sort(key=lambda x: x[0])
-        # 近接ノードを間引いてから上限を適用(パッド列は角が重なりがち)
-        nodes = []
-        seen = set()
-        cut = False
-        for _, c in corners:
-            key = (c[0] // NODE_DEDUP_NM, c[1] // NODE_DEDUP_NM)
-            if key in seen:
-                continue
-            if len(nodes) >= MAX_NODES:
-                cut = True
-                break
-            seen.add(key)
-            nodes.append(c)
-        return nodes, cut
+        return corner_candidates(obs_list, width, s, e, budget)
 
     active = []          # 経路の邪魔をした障害物だけ
     active_idx = set()

@@ -478,6 +478,13 @@ def _search_route(board, q1, q2, layer, width, net, obstacles, clr_cache):
             full.append((pcbnew.SHAPE_SEGMENT(V(*op_), V(*op_), ow),
                          (op_[0] - h, op_[1] - h, op_[0] + h, op_[1] + h),
                          max(own_clr, _net_clearance(board, onet, clr_cache))))
+        elif ob[0] == "hole":
+            _, hp, dia, onet, hclr = ob
+            if onet == net:
+                continue
+            h = dia // 2
+            full.append((pcbnew.SHAPE_SEGMENT(V(*hp), V(*hp), dia),
+                         (hp[0] - h, hp[1] - h, hp[0] + h, hp[1] + h), hclr))
         else:
             _, pad, pd, onet = ob
             if onet == net or not pad.IsOnLayer(layer):
@@ -496,25 +503,7 @@ def _search_route(board, q1, q2, layer, width, net, obstacles, clr_cache):
     active_idx = set()
     path = None
     for _ in range(len(full) + 1):
-        corners = []
-        for _, (l, t, r, btm), oc in active:
-            infl = oc + half + ts.NODE_MARGIN_NM
-            for c in ((l - infl, t - infl), (r + infl, t - infl),
-                      (r + infl, btm + infl), (l - infl, btm + infl)):
-                d = ts.octi(q1, c) + ts.octi(c, q2)
-                if d < budget:
-                    corners.append((d, c))
-        corners.sort()
-        nodes = []
-        seen = set()
-        for _, c in corners:
-            key = (c[0] // ts.NODE_DEDUP_NM, c[1] // ts.NODE_DEDUP_NM)
-            if key in seen:
-                continue
-            if len(nodes) >= ts.MAX_NODES:
-                break
-            seen.add(key)
-            nodes.append(c)
+        nodes, _cut = ts.corner_candidates(active, width, q1, q2, budget)
         path, _timed_out = ts.find_path(q1, q2, nodes, active, width,
                                         budget, deadline=deadline)
         if path is None:
@@ -569,7 +558,14 @@ def _resolve_pending(board, fp_deltas, pending, ops, stats):
         for it in extras:
             pend_uids.add(_uid(it))
 
-    obstacles = []   # ("seg", layer, a, b, width, net) / ("via", p, w, net) / ("pad", pad, d, net)
+    hole_clr = 0
+    try:  # 「穴-銅」のホールクリアランス(銅ルールとは別の独立した制約)
+        hole_clr = board.GetDesignSettings().m_HoleClearance
+    except Exception:
+        pass
+
+    obstacles = []   # ("seg", layer, a, b, width, net) / ("via", p, w, net)
+    #                  / ("pad", pad, d, net) / ("hole", p, 径, net, クリアランス)
     for t in list(board.GetTracks()):
         uid = _uid(t)
         if uid in pend_uids:
@@ -577,8 +573,16 @@ def _resolve_pending(board, fp_deltas, pending, ops, stats):
         d = moved.get(uid, (0, 0))
         if t.GetClass() == "PCB_VIA":
             p = t.GetPosition()
-            obstacles.append(("via", (p.x + d[0], p.y + d[1]),
-                              _via_width(t), t.GetNetCode()))
+            pos = (p.x + d[0], p.y + d[1])
+            obstacles.append(("via", pos, _via_width(t), t.GetNetCode()))
+            if hole_clr > 0:
+                try:
+                    dia = t.GetDrillValue()  # 未設定でも既定値を解決する
+                except Exception:
+                    dia = 0
+                if dia > 0:
+                    obstacles.append(("hole", pos, dia,
+                                      t.GetNetCode(), hole_clr))
         else:
             s, e = t.GetStart(), t.GetEnd()
             obstacles.append(("seg", t.GetLayer(),
@@ -589,6 +593,16 @@ def _resolve_pending(board, fp_deltas, pending, ops, stats):
         d = fp_delta_map.get(fp.m_Uuid.AsString(), (0, 0))
         for p in fp.Pads():
             obstacles.append(("pad", p, d, p.GetNetCode()))
+            if hole_clr > 0:
+                try:
+                    dia = max(p.GetDrillSize().x, p.GetDrillSize().y)
+                except Exception:
+                    dia = 0
+                if dia > 0:
+                    pos = p.GetPosition()
+                    obstacles.append(("hole",
+                                      (pos.x + d[0], pos.y + d[1]),
+                                      dia, p.GetNetCode(), hole_clr))
 
     clr_cache = {}
 
@@ -610,6 +624,13 @@ def _resolve_pending(board, fp_deltas, pending, ops, stats):
                 need = max(own_clr, _net_clearance(board, onet, clr_cache)) \
                     + width // 2 + ow // 2
                 if _pt_seg_d2(op_, a, b) < need * need:
+                    return False
+            elif ob[0] == "hole":
+                _, hp, dia, onet, hclr = ob
+                if onet == net:
+                    continue  # 自ネットのビア/パッドには接続してよい
+                need = hclr + width // 2 + dia // 2
+                if _pt_seg_d2(hp, a, b) < need * need:
                     return False
             else:
                 _, pad, pd, onet = ob
