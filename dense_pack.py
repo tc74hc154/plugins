@@ -8,10 +8,11 @@
 フットプリント群は1つのブロックとして扱い、内部の相対位置を保った
 まま全体を動かす。一度詰めた結果に再実行しても配置は変わらない。
 
-実行時に3x3の整列ボタンで揃え方を選ぶ:
-縦に並ぶ行同士にはボタンの横位置(左/中央/右)、
-横に並ぶ行内の部品にはボタンの縦位置(上/中央/下)が効く。
-中央ボタンで上下左右対称になる。
+実行時に3x3のボタンで詰め方を選ぶ。ボタンの各軸は独立で、
+「壁に寄せる」か「中央に揃える」かを軸ごとに決める:
+角ボタン(↖↗↙↘)は両軸とも壁=その角へ「横に寄せる→縦に落とす」を
+繰り返すテトリス的な重力詰め。辺ボタン(←→↑↓)はその方向に詰めつつ、
+直交軸は中央揃え。中央ボタン●は両軸とも中央=上下左右対称。
 
 「パッドにつながる配線も一緒に動かす」をONにすると、移動する
 パッドに乗っている配線が接続を保ったまま追従する:
@@ -35,6 +36,8 @@ GAP_NM = 0   # ブロック間ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
 TOUCH_TOL_NM = 1000  # コートヤードが「接している」とみなす距離の許容 [nm]
 
 WIRE_TOL_NM = 1000   # 配線の点一致/T字接触とみなす距離の許容 [nm]
+
+ROW_OVERLAP_FRAC = 0.5  # 同じ行とみなすY重なりの下限(低い方の高さに対する割合)
 
 ALIGN_X = {"left": 0.0, "center": 0.5, "right": 1.0}   # 行同士の横揃え
 ALIGN_Y = {"top": 0.0, "middle": 0.5, "bottom": 1.0}   # 行内の縦揃え
@@ -109,18 +112,26 @@ def pack_targets(blocks, align_x="left", align_y="top"):
     fy = ALIGN_Y[align_y]
     order = sorted(range(len(blocks)), key=lambda i: blocks[i]["top"])
 
-    # 現在のY範囲が重なるもの同士を同じ行とみなしてグループ化
+    # Y範囲の過半が重なるもの同士を同じ行とみなしてグループ化。
+    # わずかな重なり(縦長ブロックの下端が次の段にかかっている等)で
+    # 別の段まで1行に連鎖合流しないよう、重なり量が
+    # 「行とブロックの低い方の高さ×ROW_OVERLAP_FRAC」以上のときだけ合流する
     rows = []
     row = [order[0]]
+    row_top = blocks[order[0]]["top"]
     row_bottom = blocks[order[0]]["bottom"]
     for i in order[1:]:
-        if blocks[i]["top"] < row_bottom:  # 現在の行と縦に重なっている
+        b = blocks[i]
+        overlap = row_bottom - b["top"]
+        limit = ROW_OVERLAP_FRAC * min(row_bottom - row_top, b["bottom"] - b["top"])
+        if overlap >= limit and overlap > 0:
             row.append(i)
-            row_bottom = max(row_bottom, blocks[i]["bottom"])
+            row_bottom = max(row_bottom, b["bottom"])
         else:
             rows.append(row)
             row = [i]
-            row_bottom = blocks[i]["bottom"]
+            row_top = b["top"]
+            row_bottom = b["bottom"]
     rows.append(row)
 
     # 全体の左上を基準点にして、行・列の順序を保ったまま詰める
@@ -140,6 +151,74 @@ def pack_targets(blocks, align_x="left", align_y="top"):
             x += blocks[i]["w"]
         y += row_h
     return targets
+
+def gravity_targets(blocks, gx, gy):
+    """ブロックをボタン方向の壁に向けて滑らせて詰める(テトリス的コンパクション)。
+    gx: -1=左へ, 0=横は動かさない, +1=右へ
+    gy: -1=上へ, 0=縦は動かさない, +1=下へ
+    横に寄せる→縦に落とすの順で、動かなくなるまで繰り返す。
+    滑る方向にしか動かないので、ブロック同士の前後関係は崩れない。
+    返り値: 各ブロックの目標BBox左上のリスト。blocks: [{left, top, w, h}]"""
+    n = len(blocks)
+    pos = [(b["left"], b["top"]) for b in blocks]
+    w = [b["w"] for b in blocks]
+    h = [b["h"] for b in blocks]
+    left_wall = min(p[0] for p in pos)
+    top_wall = min(p[1] for p in pos)
+    right_wall = max(pos[i][0] + w[i] for i in range(n))
+    bottom_wall = max(pos[i][1] + h[i] for i in range(n))
+
+    def ovl(a0, a1, b0, b1):
+        return min(a1, b1) - max(a0, b0) > 0
+
+    moved = True
+    rounds = 0
+    while moved and rounds <= n + 2:
+        moved = False
+        rounds += 1
+        if gx:
+            for i in sorted(range(n), key=lambda k: pos[k][0], reverse=(gx > 0)):
+                x, y = pos[i]
+                if gx < 0:
+                    t = left_wall
+                    for j in range(n):
+                        if j != i and pos[j][0] <= x \
+                           and ovl(y, y + h[i], pos[j][1], pos[j][1] + h[j]):
+                            t = max(t, pos[j][0] + w[j])
+                    if t < x:
+                        pos[i] = (t, y)
+                        moved = True
+                else:
+                    t = right_wall - w[i]
+                    for j in range(n):
+                        if j != i and pos[j][0] >= x \
+                           and ovl(y, y + h[i], pos[j][1], pos[j][1] + h[j]):
+                            t = min(t, pos[j][0] - w[i])
+                    if t > x:
+                        pos[i] = (t, y)
+                        moved = True
+        if gy:
+            for i in sorted(range(n), key=lambda k: pos[k][1], reverse=(gy > 0)):
+                x, y = pos[i]
+                if gy < 0:
+                    t = top_wall
+                    for j in range(n):
+                        if j != i and pos[j][1] <= y \
+                           and ovl(x, x + w[i], pos[j][0], pos[j][0] + w[j]):
+                            t = max(t, pos[j][1] + h[j])
+                    if t < y:
+                        pos[i] = (x, t)
+                        moved = True
+                else:
+                    t = bottom_wall - h[i]
+                    for j in range(n):
+                        if j != i and pos[j][1] >= y \
+                           and ovl(x, x + w[i], pos[j][0], pos[j][0] + w[j]):
+                            t = min(t, pos[j][1] - h[i])
+                    if t > y:
+                        pos[i] = (x, t)
+                        moved = True
+    return pos
 
 def _canon_map(points, tol=WIRE_TOL_NM):
     """近接する点(チェビシェフ距離≤tol)を代表点に写す辞書。決定的。"""
@@ -442,9 +521,18 @@ def pack_selected(board, align_x="left", align_y="top", move_wires=False):
             "members": members,
         })
 
+    # 角ボタン(両軸とも壁)はテトリス的な重力詰め。
+    # 辺・中央ボタンは行ベースの詰めで、壁でない軸は中央揃えになる
+    if align_x != "center" and align_y != "middle":
+        gx = -1 if align_x == "left" else 1
+        gy = -1 if align_y == "top" else 1
+        targets = gravity_targets(blocks, gx, gy)
+    else:
+        targets = pack_targets(blocks, align_x, align_y)
+
     # 各部品の目標位置と移動量を先に確定する(計画は移動前の形状で行う)
     fp_moves = []   # (fp, target, delta)
-    for block, (tx, ty) in zip(blocks, pack_targets(blocks, align_x, align_y)):
+    for block, (tx, ty) in zip(blocks, targets):
         for fp, off in block["members"]:
             target = pcbnew.VECTOR2I(tx, ty) + off
             pos = fp.GetPosition()
@@ -471,16 +559,17 @@ class AlignPackDialog(wx.Dialog):
     LABELS = (("↖", "↑", "↗"),
               ("←", "●", "→"),
               ("↙", "↓", "↘"))
-    JP_X = {"left": "左揃え", "center": "中央", "right": "右揃え"}
-    JP_Y = {"top": "上揃え", "middle": "中央", "bottom": "下揃え"}
+    JP_X = {"left": "左に寄せる", "center": "左右中央", "right": "右に寄せる"}
+    JP_Y = {"top": "上に詰める", "middle": "上下中央", "bottom": "下に詰める"}
 
     def __init__(self, parent, last):
         super().__init__(parent, title="整列して詰める")
         self.choice = None
         outer = wx.BoxSizer(wx.VERTICAL)
         note = wx.StaticText(
-            self, label="縦の並びには横位置、横の並びには縦位置が効きます\n"
-                        "（中央 ● で上下左右対称）")
+            self, label="軸ごとに「壁に寄せる/中央に揃える」を選びます\n"
+                        "（角=重力詰め 例:↙は左に寄せて下に落とす、"
+                        "辺=詰め+直交軸は中央、● は上下左右対称）")
         outer.Add(note, 0, wx.ALL, 8)
         grid = wx.GridSizer(3, 3, 4, 4)
         focus_btn = None
@@ -488,7 +577,10 @@ class AlignPackDialog(wx.Dialog):
             for c, ax in enumerate(self.XS):
                 btn = wx.Button(self, label=self.LABELS[r][c],
                                 size=wx.Size(48, 48))
-                btn.SetToolTip(f"行同士: {self.JP_X[ax]} / 行内: {self.JP_Y[ay]}")
+                if ax == "center" and ay == "middle":
+                    btn.SetToolTip("上下左右対称")
+                else:
+                    btn.SetToolTip(f"{self.JP_X[ax]} / {self.JP_Y[ay]}")
                 btn.Bind(wx.EVT_BUTTON,
                          lambda e, a=(ax, ay): self._pick(a))
                 if [ax, ay] == list(last):
