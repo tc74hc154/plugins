@@ -18,11 +18,12 @@
 パッドに乗っている配線が接続を保ったまま追従する:
 つながる先がすべて同じ量だけ動く配線は形を保ったまま平行移動、
 動かない側にもつながる配線は接続点だけ追従して伸びる。
-伸びる区間は45度+軸方向のL字で引くので斜め線にはならない
-(途中にT字接続がある線分は接続点で分割して接続を保つ)。
+伸びる区間は45度+軸方向で引き、経路候補(L字2種+Z字3種)を
+移動後の盤面に当たり判定して、他ネットの銅にクリアランス未満で
+近づかない候補を選ぶ。全候補が塞がっていれば既定のL字で引いて
+件数を警告する(途中のT字接続は接続点で分割して保つ)。
 円弧は伸縮できないため追従せず、件数を警告する。
-移動先の重なり(DRC)はチェックしない。遠回りが残ったら
-track_shorten で引き直すと短くなる。
+遠回りが残ったら track_shorten で引き直すと短くなる。
 
 最短配線などは考慮しない、単純な「隙間詰め」ツール。
 部品を意図した並びに置いてから実行すると、その並びのままギャップ0になる。"""
@@ -278,6 +279,77 @@ def _octi_path(q1, q2, diag_at_start):
         corner = (q2[0] - sx * m, q2[1] - sy * m)
     return [q1, corner, q2]
 
+def _segs_intersect(a1, a2, b1, b2):
+    """線分a1a2とb1b2が交差するか(接触含む)。整数座標の外積判定。"""
+    def cross(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+
+    def on_seg(o, p, q):
+        return (min(o[0], p[0]) <= q[0] <= max(o[0], p[0])
+                and min(o[1], p[1]) <= q[1] <= max(o[1], p[1]))
+
+    d1 = cross(b1, b2, a1)
+    d2 = cross(b1, b2, a2)
+    d3 = cross(a1, a2, b1)
+    d4 = cross(a1, a2, b2)
+    if ((d1 > 0) != (d2 > 0) or d1 == 0 or d2 == 0) \
+       and ((d3 > 0) != (d4 > 0) or d3 == 0 or d4 == 0):
+        if (d1 > 0) != (d2 > 0) and (d3 > 0) != (d4 > 0):
+            return True
+        for d, seg, p in ((d1, (b1, b2), a1), (d2, (b1, b2), a2),
+                          (d3, (a1, a2), b1), (d4, (a1, a2), b2)):
+            if d == 0 and on_seg(seg[0], seg[1], p):
+                return True
+    return False
+
+def _seg_seg_d2(a1, a2, b1, b2):
+    """線分同士の距離の2乗。"""
+    if _segs_intersect(a1, a2, b1, b2):
+        return 0
+    return min(_pt_seg_d2(a1, b1, b2), _pt_seg_d2(a2, b1, b2),
+               _pt_seg_d2(b1, a1, a2), _pt_seg_d2(b2, a1, a2))
+
+def _seg_rect_d2(a, b, left, top, right, bottom):
+    """線分abと矩形の距離の2乗。"""
+    if left <= a[0] <= right and top <= a[1] <= bottom:
+        return 0
+    if left <= b[0] <= right and top <= b[1] <= bottom:
+        return 0
+    lt, rt = (left, top), (right, top)
+    lb, rb = (left, bottom), (right, bottom)
+    return min(_seg_seg_d2(a, b, lt, rt), _seg_seg_d2(a, b, rt, rb),
+               _seg_seg_d2(a, b, rb, lb), _seg_seg_d2(a, b, lb, lt))
+
+def _flex_candidates(q1, q2, diag_at_start):
+    """q1→q2の45度+軸の経路候補(線分リスト)を優先順に返す。
+    L字2種(斜めを動いた端側/固定端側)+Z字3種(斜めを中間25/50/75%に)。"""
+    outs = []
+    for ds in (diag_at_start, not diag_at_start):
+        pts = _octi_path(q1, q2, ds)
+        segs = [s for s in zip(pts, pts[1:]) if s[0] != s[1]]
+        if segs not in outs:
+            outs.append(segs)
+    dx, dy = q2[0] - q1[0], q2[1] - q1[1]
+    adx, ady = abs(dx), abs(dy)
+    if adx and ady and adx != ady:
+        m = min(adx, ady)
+        sx = 1 if dx > 0 else -1
+        sy = 1 if dy > 0 else -1
+        for t in (0.5, 0.25, 0.75):
+            if adx > ady:
+                x1 = q1[0] + sx * int((adx - m) * t)
+                p1 = (x1, q1[1])
+                p2 = (x1 + sx * m, q2[1])
+            else:
+                y1 = q1[1] + sy * int((ady - m) * t)
+                p1 = (q1[0], y1)
+                p2 = (q2[0], y1 + sy * m)
+            pts = [q1, p1, p2, q2]
+            segs = [s for s in zip(pts, pts[1:]) if s[0] != s[1]]
+            if segs not in outs:
+                outs.append(segs)
+    return outs
+
 def _pad_hits(pads, pt, layer):
     """pt(x,y)が乗っているパッドのレコードを返す。layer=Noneは層を見ない(ビア用)。"""
     v = pcbnew.VECTOR2I(pt[0], pt[1])
@@ -305,7 +377,7 @@ def plan_wire_moves(board, fp_deltas, tol=WIRE_TOL_NM):
     触れていない連結群は丸ごと平行移動。それ以外は接続点だけ追従して伸縮し、
     変形する線分の途中にT字接続があれば接続点で分割して接続を保つ。
     """
-    stats = {"rigid": 0, "stretch": 0, "added": 0, "arc_skip": 0}
+    stats = {"rigid": 0, "stretch": 0, "added": 0, "arc_skip": 0, "overlap": 0}
     moving = {}
     for fp, d in fp_deltas:
         if d != (0, 0):
@@ -337,11 +409,134 @@ def plan_wire_moves(board, fp_deltas, tol=WIRE_TOL_NM):
         if t.GetNetCode() in nets:
             by_net.setdefault(t.GetNetCode(), []).append(t)
 
+    pending = []   # 変形する線分: (item, layer, width, net, specs)
     for items in by_net.values():
-        _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats)
+        _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats, pending)
+    if pending:
+        _resolve_pending(board, fp_deltas, pending, ops, stats)
     return ops, stats
 
-def _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats):
+def _net_clearance(board, netcode, cache):
+    """ネットクラスの銅クリアランス。SWIGで安全に引けるのは
+    GetNetClassName→GetAllNetClasses経由のみ(罠#20)。"""
+    if netcode in cache:
+        return cache[netcode]
+    clr = int(0.2e6)
+    try:
+        name = board.FindNet(netcode).GetNetClassName()
+        clr = board.GetAllNetClasses()[name].GetClearance()
+    except Exception:
+        try:
+            clr = board.GetAllNetClasses()["Default"].GetClearance()
+        except Exception:
+            pass
+    cache[netcode] = clr
+    return clr
+
+def _via_width(v):
+    """ビアの径。KiCad10のPCB_VIA::GetWidth()はレイヤ引数が必要(引数なしはassert)。"""
+    try:
+        return v.GetWidth(pcbnew.F_Cu)
+    except TypeError:
+        return v.GetWidth()
+
+def _resolve_pending(board, fp_deltas, pending, ops, stats):
+    """変形する区間の経路を、移動後の盤面に対する当たり判定つきで決める。
+    候補(L字2種+Z字3種)を順に試し、他ネットの銅にクリアランス未満で
+    近づかない最初の候補を採る。全滅なら既定のL字にして overlap を数える。"""
+    moved = {}
+    for op in ops:
+        if op[0] == "move":
+            moved[op[1].m_Uuid.AsString()] = op[2]
+    pend_uids = {it.m_Uuid.AsString() for it, _, _, _, _ in pending}
+
+    obstacles = []   # ("seg", layer, a, b, width, net) / ("via", p, w, net) / ("pad", pad, d, net)
+    for t in list(board.GetTracks()):
+        uid = t.m_Uuid.AsString()
+        if uid in pend_uids:
+            continue   # 引き直す本人の旧形状は障害物にしない
+        d = moved.get(uid, (0, 0))
+        if t.GetClass() == "PCB_VIA":
+            p = t.GetPosition()
+            obstacles.append(("via", (p.x + d[0], p.y + d[1]),
+                              _via_width(t), t.GetNetCode()))
+        else:
+            s, e = t.GetStart(), t.GetEnd()
+            obstacles.append(("seg", t.GetLayer(),
+                              (s.x + d[0], s.y + d[1]), (e.x + d[0], e.y + d[1]),
+                              t.GetWidth(), t.GetNetCode()))
+    fp_delta_map = {fp.m_Uuid.AsString(): dv for fp, dv in fp_deltas}
+    for fp in board.GetFootprints():
+        d = fp_delta_map.get(fp.m_Uuid.AsString(), (0, 0))
+        for p in fp.Pads():
+            obstacles.append(("pad", p, d, p.GetNetCode()))
+
+    clr_cache = {}
+
+    def seg_clear(a, b, layer, width, net):
+        own_clr = _net_clearance(board, net, clr_cache)
+        for ob in obstacles:
+            if ob[0] == "seg":
+                _, ol, oa, obp, ow, onet = ob
+                if onet == net or ol != layer:
+                    continue
+                need = max(own_clr, _net_clearance(board, onet, clr_cache)) \
+                    + width // 2 + ow // 2
+                if _seg_seg_d2(a, b, oa, obp) < need * need:
+                    return False
+            elif ob[0] == "via":
+                _, op_, ow, onet = ob
+                if onet == net:
+                    continue
+                need = max(own_clr, _net_clearance(board, onet, clr_cache)) \
+                    + width // 2 + ow // 2
+                if _pt_seg_d2(op_, a, b) < need * need:
+                    return False
+            else:
+                _, pad, pd, onet = ob
+                if onet == net or not pad.IsOnLayer(layer):
+                    continue
+                bb = pad.GetBoundingBox()
+                need = max(own_clr, _net_clearance(board, onet, clr_cache)) \
+                    + width // 2
+                if _seg_rect_d2(a, b, bb.GetLeft() + pd[0], bb.GetTop() + pd[1],
+                                bb.GetRight() + pd[0],
+                                bb.GetBottom() + pd[1]) < need * need:
+                    return False
+        return True
+
+    for item, layer, width, net, specs in pending:
+        subs = []
+        for spec in specs:
+            if spec[0] == "fix":
+                subs.append((spec[1], spec[2]))
+                continue
+            _, q1, q2, diag_start = spec
+            chosen = None
+            for cand in _flex_candidates(q1, q2, diag_start):
+                if all(seg_clear(a, b, layer, width, net) for a, b in cand):
+                    chosen = cand
+                    break
+            if chosen is None:
+                stats["overlap"] += 1
+                pts = _octi_path(q1, q2, diag_start)
+                chosen = [s for s in zip(pts, pts[1:]) if s[0] != s[1]]
+            subs.extend(chosen)
+        if not subs:
+            continue
+        first = True
+        for a, b in subs:
+            if first:
+                ops.append(("set", item, a, b))
+                stats["stretch"] += 1
+                first = False
+            else:
+                ops.append(("add", a, b, width, layer, net))
+                stats["added"] += 1
+        for a, b in subs:
+            obstacles.append(("seg", layer, a, b, width, net))
+
+def _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats, pending):
     infos = []    # (kind, layer, pts)
     all_pts = []
     for t in items:
@@ -446,30 +641,20 @@ def _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats):
                     stats["stretch"] += 1
                     continue
                 # 節点ごとに追従量が違う → 接続点で分割しつつ端点を動かす。
-                # 変形する区間は45度+軸のL字にして斜め線を作らない
-                subs = []
+                # 変形する区間の経路は後段で障害物を見て決める(pendingへ)
+                specs = []
                 for (p1, d1), (p2, d2) in zip(nodes, nodes[1:]):
                     q1 = (p1[0] + d1[0], p1[1] + d1[1])
                     q2 = (p2[0] + d2[0], p2[1] + d2[1])
                     if q1 == q2:
                         continue
                     if d1 == d2:
-                        subs.append((q1, q2))  # 平行移動区間は形そのまま
+                        specs.append(("fix", q1, q2))   # 平行移動区間は形そのまま
                     else:
-                        opts = _octi_path(q1, q2, diag_at_start=(d1 != (0, 0)))
-                        subs.extend(zip(opts, opts[1:]))
-                if not subs:
-                    continue
-                first = True
-                for q1, q2 in subs:
-                    if first:
-                        ops.append(("set", items[i], q1, q2))
-                        stats["stretch"] += 1
-                        first = False
-                    else:
-                        ops.append(("add", q1, q2, items[i].GetWidth(),
-                                    layer, items[i].GetNetCode()))
-                        stats["added"] += 1
+                        specs.append(("flex", q1, q2, d1 != (0, 0)))
+                if specs:
+                    pending.append((items[i], layer, items[i].GetWidth(),
+                                    items[i].GetNetCode(), specs))
 
 def apply_wire_ops(board, ops):
     V = pcbnew.VECTOR2I
@@ -626,10 +811,16 @@ class DensePack(pcbnew.ActionPlugin):
             board.BuildConnectivity()  # 配線を変えたのでラッツネストを更新
         pcbnew.Refresh()
         w = result["wire"]
+        warns = []
         if w and w["arc_skip"]:
-            wx.MessageBox(
-                f"円弧を含む配線 {w['arc_skip']} 本は追従できませんでした。\n"
-                "手で直すか、円弧を線分に置き換えてから再実行してください。",
-                "整列して詰める", wx.OK | wx.ICON_WARNING, parent)
+            warns.append(f"円弧を含む配線 {w['arc_skip']} 本は追従できませんでした。\n"
+                         "手で直すか、円弧を線分に置き換えてから再実行してください。")
+        if w and w["overlap"]:
+            warns.append(f"他の配線との重なりを避けられなかった区間が "
+                         f"{w['overlap']} 箇所あります。\n"
+                         "track_shorten で引き直すか手で調整してください。")
+        if warns:
+            wx.MessageBox("\n\n".join(warns), "整列して詰める",
+                          wx.OK | wx.ICON_WARNING, parent)
 
 DensePack().register()
