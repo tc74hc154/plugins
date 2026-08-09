@@ -13,8 +13,20 @@
 横に並ぶ行内の部品にはボタンの縦位置(上/中央/下)が効く。
 中央ボタンで上下左右対称になる。
 
+「パッドにつながる配線も一緒に動かす」をONにすると、移動する
+パッドに乗っている配線が接続を保ったまま追従する:
+つながる先がすべて同じ量だけ動く配線は形を保ったまま平行移動、
+動かない側にもつながる配線は接続点だけ追従して伸びる。
+伸びる区間は45度+軸方向のL字で引くので斜め線にはならない
+(途中にT字接続がある線分は接続点で分割して接続を保つ)。
+円弧は伸縮できないため追従せず、件数を警告する。
+移動先の重なり(DRC)はチェックしない。遠回りが残ったら
+track_shorten で引き直すと短くなる。
+
 最短配線などは考慮しない、単純な「隙間詰め」ツール。
 部品を意図した並びに置いてから実行すると、その並びのままギャップ0になる。"""
+from bisect import bisect_left, bisect_right
+
 import pcbnew
 import wx
 
@@ -22,9 +34,12 @@ ICON = "🧱"  # パレットのカードに表示するアイコン
 GAP_NM = 0   # ブロック間ギャップ [nm] 例: 0.1mm なら int(0.1 * 1e6)
 TOUCH_TOL_NM = 1000  # コートヤードが「接している」とみなす距離の許容 [nm]
 
+WIRE_TOL_NM = 1000   # 配線の点一致/T字接触とみなす距離の許容 [nm]
+
 ALIGN_X = {"left": 0.0, "center": 0.5, "right": 1.0}   # 行同士の横揃え
 ALIGN_Y = {"top": 0.0, "middle": 0.5, "bottom": 1.0}   # 行内の縦揃え
 LAST_ALIGN = ["center", "middle"]  # セッション内で最後に選んだボタンを覚える
+LAST_WIRES = [True]                # 「配線も動かす」チェックの前回値
 
 def courtyard_bbox(fp):
     """コートヤード枠線の中心線基準BBoxを返す。
@@ -126,11 +141,286 @@ def pack_targets(blocks, align_x="left", align_y="top"):
         y += row_h
     return targets
 
-def pack_selected(board, align_x="left", align_y="top"):
-    """選択フットプリントをブロック化して詰める。動かした個数を返す。"""
+def _canon_map(points, tol=WIRE_TOL_NM):
+    """近接する点(チェビシェフ距離≤tol)を代表点に写す辞書。決定的。"""
+    cells = {}
+    out = {}
+    for p in sorted(set(points)):
+        cx, cy = p[0] // tol, p[1] // tol
+        rep = None
+        for nx in (cx - 1, cx, cx + 1):
+            for ny in (cy - 1, cy, cy + 1):
+                for r in cells.get((nx, ny), ()):
+                    if abs(r[0] - p[0]) <= tol and abs(r[1] - p[1]) <= tol:
+                        rep = r
+                        break
+                if rep:
+                    break
+            if rep:
+                break
+        if rep is None:
+            cells.setdefault((cx, cy), []).append(p)
+            rep = p
+        out[p] = rep
+    return out
+
+def _pt_seg_d2(p, a, b):
+    """点pと線分abの距離の2乗。"""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    if dx == 0 and dy == 0:
+        return (p[0] - a[0]) ** 2 + (p[1] - a[1]) ** 2
+    t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    cx, cy = a[0] + t * dx, a[1] + t * dy
+    return (p[0] - cx) ** 2 + (p[1] - cy) ** 2
+
+def _seg_param(a, b, p):
+    """線分ab上での点pの位置(0..1)。タップ点のソート用。"""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    d2 = dx * dx + dy * dy
+    if d2 == 0:
+        return 0.0
+    return ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / d2
+
+def _octi_path(q1, q2, diag_at_start):
+    """q1→q2を45度線+軸方向線のL字でつなぐ点列。
+    軸方向または45度ぴったりなら1本のまま。
+    diag_at_start=True なら斜め区間をq1側に置く(動いた端にジョグを寄せる)。"""
+    dx, dy = q2[0] - q1[0], q2[1] - q1[1]
+    adx, ady = abs(dx), abs(dy)
+    if adx == 0 or ady == 0 or adx == ady:
+        return [q1, q2]
+    m = min(adx, ady)
+    sx = 1 if dx > 0 else -1
+    sy = 1 if dy > 0 else -1
+    if diag_at_start:
+        corner = (q1[0] + sx * m, q1[1] + sy * m)
+    else:
+        corner = (q2[0] - sx * m, q2[1] - sy * m)
+    return [q1, corner, q2]
+
+def _pad_hits(pads, pt, layer):
+    """pt(x,y)が乗っているパッドのレコードを返す。layer=Noneは層を見ない(ビア用)。"""
+    v = pcbnew.VECTOR2I(pt[0], pt[1])
+    out = []
+    for rec in pads:
+        bb = rec[1]
+        if not (bb.GetLeft() <= pt[0] <= bb.GetRight()
+                and bb.GetTop() <= pt[1] <= bb.GetBottom()):
+            continue
+        if layer is not None and not rec[0].IsOnLayer(layer):
+            continue
+        if rec[0].HitTest(v):
+            out.append(rec)
+    return out
+
+def plan_wire_moves(board, fp_deltas, tol=WIRE_TOL_NM):
+    """フットプリントの移動に合わせた配線の追従を、移動前の形状から計画する。
+
+    fp_deltas: [(fp, (dx, dy))]
+    返り値: (ops, stats)
+      ops: ("move", item, (dx,dy)) 平行移動 /
+           ("set", seg, (ax,ay), (bx,by)) 既存線分の端点変更 /
+           ("add", (ax,ay), (bx,by), width, layer, net) 分割で増える線分
+    追従点(移動するパッドに乗る点)がすべて同じ移動量で、動かないパッドに
+    触れていない連結群は丸ごと平行移動。それ以外は接続点だけ追従して伸縮し、
+    変形する線分の途中にT字接続があれば接続点で分割して接続を保つ。
+    """
+    stats = {"rigid": 0, "stretch": 0, "added": 0, "arc_skip": 0}
+    moving = {}
+    for fp, d in fp_deltas:
+        if d != (0, 0):
+            moving[fp.m_Uuid.AsString()] = d
+
+    ops = []
+    if not moving:
+        return ops, stats
+
+    moving_pads = []   # (pad, bbox, delta)
+    nets = set()
+    for fp, d in fp_deltas:
+        if d == (0, 0):
+            continue
+        for p in fp.Pads():
+            if p.GetNetCode() > 0:
+                moving_pads.append((p, p.GetBoundingBox(), d))
+                nets.add(p.GetNetCode())
+    static_pads = []   # (pad, bbox) 動かない側のパッド(対象ネットのみ)
+    for fp in board.GetFootprints():
+        if fp.m_Uuid.AsString() in moving:
+            continue
+        for p in fp.Pads():
+            if p.GetNetCode() in nets:
+                static_pads.append((p, p.GetBoundingBox()))
+
+    by_net = {}
+    for t in list(board.GetTracks()):
+        if t.GetNetCode() in nets:
+            by_net.setdefault(t.GetNetCode(), []).append(t)
+
+    for items in by_net.values():
+        _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats)
+    return ops, stats
+
+def _plan_net_moves(items, moving_pads, static_pads, tol, ops, stats):
+    infos = []    # (kind, layer, pts)
+    all_pts = []
+    for t in items:
+        cls = t.GetClass()
+        if cls == "PCB_VIA":
+            pos = t.GetPosition()
+            infos.append(("via", None, [(pos.x, pos.y)]))
+        else:
+            kind = "arc" if cls == "PCB_ARC" else "seg"
+            s, e = t.GetStart(), t.GetEnd()
+            infos.append((kind, t.GetLayer(), [(s.x, s.y), (e.x, e.y)]))
+        all_pts.extend(infos[-1][2])
+    canon = _canon_map(all_pts, tol)
+
+    owners = {}   # 代表点 -> [item index]
+    for i, (_, _, pts) in enumerate(infos):
+        for p in pts:
+            owners.setdefault(canon[p], []).append(i)
+
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for idxs in owners.values():
+        for j in idxs[1:]:
+            parent[find(idxs[0])] = find(j)
+
+    # 線分の途中に乗っている他アイテムの端点(T字接続)を拾う
+    cps_sorted = sorted(owners)
+    xs = [c[0] for c in cps_sorted]
+    taps = {}   # item index -> [代表点]
+    for i, (kind, _, pts) in enumerate(infos):
+        if kind != "seg":
+            continue
+        a, b = pts
+        ca, cb = canon[a], canon[b]
+        ylo, yhi = min(a[1], b[1]) - tol, max(a[1], b[1]) + tol
+        lo = bisect_left(xs, min(a[0], b[0]) - tol)
+        hi = bisect_right(xs, max(a[0], b[0]) + tol)
+        for cp in cps_sorted[lo:hi]:
+            if cp == ca or cp == cb or not (ylo <= cp[1] <= yhi):
+                continue
+            if _pt_seg_d2(cp, a, b) <= tol * tol:
+                taps.setdefault(i, []).append(cp)
+                parent[find(i)] = find(owners[cp][0])
+
+    # 追従する点のマーク付けと、動かないパッドへの接触の記録
+    mark = {}         # 代表点 -> delta
+    static_hit = set()
+    for i, (kind, layer, pts) in enumerate(infos):
+        for p in pts:
+            cp = canon[p]
+            hits = _pad_hits(moving_pads, p, layer)
+            if hits and cp not in mark:
+                mark[cp] = hits[0][2]
+            if _pad_hits(static_pads, p, layer):
+                static_hit.add(cp)
+
+    groups = {}
+    for i in range(len(items)):
+        groups.setdefault(find(i), []).append(i)
+
+    for g in groups.values():
+        cps = {canon[p] for i in g for p in infos[i][2]}
+        seeds = {mark[cp] for cp in cps if cp in mark}
+        if not seeds:
+            continue
+        if len(seeds) == 1 and not (cps & static_hit):
+            # 連結群全体が同じ量だけ動く → 形を保ったまま平行移動
+            d = seeds.pop()
+            for i in g:
+                ops.append(("move", items[i], d))
+            stats["rigid"] += len(g)
+            continue
+        # 伸縮: 接続点だけ追従させる
+        for i in g:
+            kind, layer, pts = infos[i]
+            if kind == "via":
+                d = mark.get(canon[pts[0]], (0, 0))
+                if d != (0, 0):
+                    ops.append(("move", items[i], d))
+                    stats["stretch"] += 1
+            elif kind == "arc":
+                if any(mark.get(canon[p], (0, 0)) != (0, 0) for p in pts):
+                    stats["arc_skip"] += 1
+            else:
+                a, b = pts
+                nodes = [(a, mark.get(canon[a], (0, 0)))]
+                for cp in sorted(taps.get(i, ()),
+                                 key=lambda c: _seg_param(a, b, c)):
+                    nodes.append((cp, mark.get(cp, (0, 0))))
+                nodes.append((b, mark.get(canon[b], (0, 0))))
+                deltas = {d for _, d in nodes}
+                if deltas == {(0, 0)}:
+                    continue
+                if len(deltas) == 1:
+                    ops.append(("move", items[i], deltas.pop()))
+                    stats["stretch"] += 1
+                    continue
+                # 節点ごとに追従量が違う → 接続点で分割しつつ端点を動かす。
+                # 変形する区間は45度+軸のL字にして斜め線を作らない
+                subs = []
+                for (p1, d1), (p2, d2) in zip(nodes, nodes[1:]):
+                    q1 = (p1[0] + d1[0], p1[1] + d1[1])
+                    q2 = (p2[0] + d2[0], p2[1] + d2[1])
+                    if q1 == q2:
+                        continue
+                    if d1 == d2:
+                        subs.append((q1, q2))  # 平行移動区間は形そのまま
+                    else:
+                        opts = _octi_path(q1, q2, diag_at_start=(d1 != (0, 0)))
+                        subs.extend(zip(opts, opts[1:]))
+                if not subs:
+                    continue
+                first = True
+                for q1, q2 in subs:
+                    if first:
+                        ops.append(("set", items[i], q1, q2))
+                        stats["stretch"] += 1
+                        first = False
+                    else:
+                        ops.append(("add", q1, q2, items[i].GetWidth(),
+                                    layer, items[i].GetNetCode()))
+                        stats["added"] += 1
+
+def apply_wire_ops(board, ops):
+    V = pcbnew.VECTOR2I
+    for op in ops:
+        if op[0] == "move":
+            _, item, d = op
+            item.ClearSelected()  # 選択中アイテムの変更はクラッシュの前科あり(罠#1)
+            item.Move(V(d[0], d[1]))
+        elif op[0] == "set":
+            _, item, a, b = op
+            item.ClearSelected()
+            item.SetStart(V(a[0], a[1]))
+            item.SetEnd(V(b[0], b[1]))
+        else:  # add
+            _, a, b, width, layer, net = op
+            t = pcbnew.PCB_TRACK(board)
+            t.SetStart(V(a[0], a[1]))
+            t.SetEnd(V(b[0], b[1]))
+            t.SetWidth(width)
+            t.SetLayer(layer)
+            t.SetNetCode(net)
+            board.Add(t)
+
+def pack_selected(board, align_x="left", align_y="top", move_wires=False):
+    """選択フットプリントをブロック化して詰める。
+    move_wires=True ならパッドにつながる配線も接続を保ったまま追従させる。
+    返り値: {"moved": 動かした部品数, "wire": 配線statsまたはNone}"""
     fps = [fp for fp in board.GetFootprints() if fp.IsSelected()]
     if not fps:
-        return 0
+        return {"moved": 0, "wire": None}
 
     rects = []
     for fp in fps:
@@ -152,14 +442,27 @@ def pack_selected(board, align_x="left", align_y="top"):
             "members": members,
         })
 
-    moved = 0
+    # 各部品の目標位置と移動量を先に確定する(計画は移動前の形状で行う)
+    fp_moves = []   # (fp, target, delta)
     for block, (tx, ty) in zip(blocks, pack_targets(blocks, align_x, align_y)):
         for fp, off in block["members"]:
             target = pcbnew.VECTOR2I(tx, ty) + off
-            if fp.GetPosition() != target:
-                fp.SetPosition(target)
-                moved += 1
-    return moved
+            pos = fp.GetPosition()
+            fp_moves.append((fp, target, (target.x - pos.x, target.y - pos.y)))
+
+    wire_stats = None
+    wire_ops = []
+    if move_wires:
+        wire_ops, wire_stats = plan_wire_moves(
+            board, [(fp, d) for fp, _, d in fp_moves])
+
+    moved = 0
+    for fp, target, d in fp_moves:
+        if d != (0, 0):
+            fp.SetPosition(target)
+            moved += 1
+    apply_wire_ops(board, wire_ops)
+    return {"moved": moved, "wire": wire_stats}
 
 class AlignPackDialog(wx.Dialog):
     """3x3の整列ボタン。押した位置で揃え方が決まり、即実行される。"""
@@ -192,6 +495,10 @@ class AlignPackDialog(wx.Dialog):
                     focus_btn = btn
                 grid.Add(btn, 0, wx.EXPAND)
         outer.Add(grid, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.ALIGN_CENTER, 8)
+        self.cb_wires = wx.CheckBox(
+            self, label="パッドにつながる配線も一緒に動かす")
+        self.cb_wires.SetValue(LAST_WIRES[0])
+        outer.Add(self.cb_wires, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         self.SetSizerAndFit(outer)
         if focus_btn is not None:
             focus_btn.SetFocus()
@@ -217,10 +524,20 @@ class DensePack(pcbnew.ActionPlugin):
             if dlg.ShowModal() != wx.ID_OK or dlg.choice is None:
                 return  # ×/Escは何もしない
             align_x, align_y = dlg.choice
+            move_wires = dlg.cb_wires.GetValue()
         finally:
             dlg.Destroy()
         LAST_ALIGN[:] = [align_x, align_y]
-        pack_selected(board, align_x, align_y)
+        LAST_WIRES[0] = move_wires
+        result = pack_selected(board, align_x, align_y, move_wires)
+        if move_wires:
+            board.BuildConnectivity()  # 配線を変えたのでラッツネストを更新
         pcbnew.Refresh()
+        w = result["wire"]
+        if w and w["arc_skip"]:
+            wx.MessageBox(
+                f"円弧を含む配線 {w['arc_skip']} 本は追従できませんでした。\n"
+                "手で直すか、円弧を線分に置き換えてから再実行してください。",
+                "整列して詰める", wx.OK | wx.ICON_WARNING, parent)
 
 DensePack().register()
