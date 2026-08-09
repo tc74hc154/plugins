@@ -83,6 +83,42 @@ def discover_tools():
     return tools
 
 
+def run_tool(tool):
+    """ツールを実行する。可能ならKiCad本体のメニューイベント経由で。
+
+    inst.Run() を直接呼ぶと、KiCadがメニュー実行時に行う「実行前後の
+    基板スナップショット→Undoエントリ作成」(RunActionPlugin)を素通りして
+    しまい、プラグインが行った削除/追加がUndo履歴に載らない。その状態で
+    Ctrl+Z すると過去のUndoエントリが削除済みアイテムを参照して
+    「Incomplete undo/redo operation: some items not found」になる。
+    そこで「ツール→外部プラグイン」のメニュー項目を探して本物の
+    コマンドイベントを同期発火し、KiCad純正のUndoラッパーに乗せる。
+    メニューが見つからないときだけ直接Run()にフォールバックする(Undo不可)。
+    """
+    frame = wx.FindWindowByName("PcbFrame")
+    menubar = frame.GetMenuBar() if frame is not None else None
+    if menubar is not None:
+
+        def find_id(menu):
+            for item in menu.GetMenuItems():
+                sub = item.GetSubMenu()
+                if sub is not None:
+                    found = find_id(sub)
+                    if found is not None:
+                        return found
+                elif item.GetItemLabelText() == tool["name"]:
+                    return item.GetId()
+            return None
+
+        for i in range(menubar.GetMenuCount()):
+            mid = find_id(menubar.GetMenu(i))
+            if mid is not None:
+                evt = wx.CommandEvent(wx.EVT_MENU.typeId, mid)
+                frame.GetEventHandler().ProcessEvent(evt)  # 同期実行
+                return
+    tool["inst"].Run()
+
+
 def _tools_json(tools):
     payload = [{k: t[k] for k in ("name", "summary", "detail", "icon", "category")}
                for t in tools]
@@ -185,7 +221,7 @@ let view = [];
 let running = false;
 const IDLE_HINT = "Enter: 実行 / ↑↓: 選択 / Esc: 隠す / ツールバーのボタンで表示切替";
 const CAT_JA = {"Placement": "配置", "Routing": "配線", "Zones": "ベタ", "Export": "出力"};
-const CAT_ICON = {"Placement": "\\ud83d\\udccd", "Zones": "\\ud83d\\udfe9"};
+const CAT_ICON = {"Placement": "\\ud83d\\udccd", "Routing": "\\u2702\\ufe0f", "Zones": "\\ud83d\\udfe9"};
 const list = document.getElementById("list");
 const q = document.getElementById("q");
 const status = document.getElementById("status");
@@ -389,7 +425,7 @@ if wx is not None and wxhtml2 is not None:
                 tool = self.tools[idx]
                 _last_tool_name = tool["name"]
                 try:
-                    tool["inst"].Run()
+                    run_tool(tool)  # メニューイベント経由(Ctrl+Zを効かせる)
                 except Exception:
                     wx.MessageBox(
                         traceback.format_exc(),
@@ -520,7 +556,7 @@ class PackToolLauncher(pcbnew.ActionPlugin):
         tool = tools[idx]
         _last_tool_name = tool["name"]
         try:
-            tool["inst"].Run()
+            run_tool(tool)  # メニューイベント経由(Ctrl+Zを効かせる)
         except Exception:
             wx.MessageBox(
                 traceback.format_exc(),
