@@ -1242,7 +1242,11 @@ def replace_chain(board, chain, pts):
     for t, a, b in chain["edges"] + chain["extra_edges"]:
         consumed.setdefault(_uid(t), set()).add((a, b))
     for uid, track in chain["tracks"].items():
-        keep = [e for e in chain["track_edges"][uid]
+        # 別グループから吸収したゴミ断片は track_edges に載っていないので、
+        # midspan_contact と同じ物理端点にフォールバックする(全消費=復元なし)
+        all_edges = chain["track_edges"].get(
+            uid, [(_pt(track.GetStart()), _pt(track.GetEnd()))])
+        keep = [e for e in all_edges
                 if e not in consumed.get(uid, ())]
         w = track.GetWidth()
         track.ClearSelected()  # 選択中アイテムのRemoveはクラッシュの前科あり(罠#1)
