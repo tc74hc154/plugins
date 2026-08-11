@@ -7,7 +7,10 @@
   （ビア径と「ドリル径 + 穴間の最小距離」の大きい方）で最も密になる
 - 全銅箔層の他ネットの配線・パッド・ビアとのクリアランス、穴同士の
   最小距離、基板端クリアランス、ビア禁止ルールエリアを避ける
-- ビアはパッドの上には置かない（同ネットでも避ける）
+- パッドの境界線とレジスト開口の境界線には「境界マージン」より近づかない。
+  同ネットのパッドは「同ネットのパッド上も可」でビア・イン・パッドを許可
+  でき、その場合も境界からマージン以上内側に完全に収まる位置にだけ置く。
+  マージン 0 = 自動（2×マスク拡張 + マスク最小幅、下限 0.1mm）
 - 他ネットのベタは避けない（塗り直せばビアを避けて充填されるため）。
   「作成後にベタを塗り直す」を付けたまま実行すれば整合が取れる
 - ベタが未塗りつぶし・塗りが古い場合も、実行時に対象ベタを塗り直して
@@ -51,6 +54,10 @@ def PANEL():  # パレット埋め込みUIの定義(pack_launcher が参照。�
          "default": drill, "min": 0.1, "max": 2.0, "step": 0.05},
         {"type": "number", "key": "pitch", "label": "間隔(0=最小)", "unit": "mm",
          "default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1},
+        {"type": "number", "key": "margin", "label": "境界から(0=自動)",
+         "unit": "mm", "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.05},
+        {"type": "check", "key": "in_pad", "label": "同ネットのパッド上も可",
+         "default": True},
         {"type": "check", "key": "refill", "label": "作成後にベタを塗り直す",
          "default": True},
         {"type": "run", "label": "敷き詰める"},
@@ -90,6 +97,60 @@ def min_pitch(board, via_nm, drill_nm):
     except Exception:
         pass
     return max(via_nm, drill_nm + h2h) + pcbnew.FromMM(0.01)
+
+
+def _auto_margin(board):
+    """パッド/レジスト開口の境界からビアを離す距離の自動値。
+
+    ビアと相手の開口が両方ともマスク拡張ぶん銅より広がっても、間に
+    製造可能な幅のレジストが残る距離 = 2×マスク拡張 + マスク最小幅。
+    基板設定が0のときは下限 0.1mm。
+    """
+    exp = minw = 0
+    try:
+        bds = board.GetDesignSettings()
+        exp = max(getattr(bds, "m_SolderMaskExpansion", 0), 0)
+        minw = max(getattr(bds, "m_SolderMaskMinWidth", 0), 0)
+    except Exception:
+        pass
+    return max(2 * exp + minw, pcbnew.FromMM(0.1))
+
+
+def _pad_mask_expansion(pad):
+    """パッドのレジスト開口の広がり（基板既定→パッド個別の解決済み）。
+
+    マスク定義パッドでは負値（開口が銅より狭い）になる。
+    開口が無い（マスク層に居ない）パッドは 0 = 銅の境界だけ見る。
+    """
+    for layer in (pcbnew.F_Mask, pcbnew.B_Mask):
+        try:
+            if pad.IsOnLayer(layer):
+                return pad.GetSolderMaskExpansion(layer)
+        except Exception:
+            pass
+    return 0
+
+
+def _pad_inside_polys(pad, layers, deflate):
+    """ビア・イン・パッドが許される領域 = パッド銅形状を deflate 縮めた層別
+    ポリゴン群。ビアはパッドが居る全銅箔層で収まる必要がある。
+    どこかの層で収まらない（縮めたら消える）パッドは None = 不可。"""
+    polys = []
+    for layer in layers:
+        if not pad.IsOnLayer(layer):
+            continue
+        try:
+            poly = pcbnew.SHAPE_POLY_SET(
+                pad.GetEffectivePolygon(layer, pcbnew.ERROR_INSIDE))
+        except Exception:
+            return None
+        poly.Deflate(deflate, pcbnew.CORNER_STRATEGY_ROUND_ALL_CORNERS,
+                     pcbnew.FromMM(0.01))
+        if not poly.OutlineCount():
+            return None
+        poly.BuildBBoxCaches()
+        polys.append(poly)
+    return polys or None
 
 
 def _refill(board, zones):
@@ -141,14 +202,19 @@ class _HoleIndex:
         return False
 
 
-def _collect_obstacles(snap, net, via_r, drill_r, region):
-    """(shape, bboxタプル, 実効クリアランス) のリストと穴索引を作る。
+def _collect_obstacles(snap, net, via_r, drill_r, region, margin, in_pad):
+    """(shape, bboxタプル, 実効クリアランス, 許可領域) のリストと穴索引と
+    ビア・イン・パッド許可領域のリストを作る。
 
     ビアは貫通なので、どの銅箔層の障害物も1本のリストにまとめてよい
     (どれか1層でも衝突すれば置けない)。
     実効クリアランス = max(銅クリアランス, ドリル半径+穴銅間クリアランス-ビア半径)。
     中心が円のビアでは「銅の環がclr以内」も「穴がhole_clr以内」も
     中心距離の条件になるので、1回のCollideにまとめられる。
+
+    パッドは境界(銅とレジスト開口)から margin 以上離す。同ネットのパッドは
+    in_pad が真なら「境界より margin 以上内側」も許可領域として返し、その
+    パッドの障害物には許可領域を添える(衝突しても内側なら置ける)。
     """
     board = snap["board"]
     bds = board.GetDesignSettings()
@@ -158,14 +224,15 @@ def _collect_obstacles(snap, net, via_r, drill_r, region):
 
     layers = [int(l) for l in board.GetEnabledLayers().CuStack()]
     obstacles = []
+    pad_regions = []
     holes = _HoleIndex(drill_r, h2h)  # 全ネット共通(穴間距離はネットを見ない)
 
-    def add(shape, bb, clr):
+    def add(shape, bb, clr, allow=None):
         t = (bb.GetLeft(), bb.GetTop(), bb.GetRight(), bb.GetBottom())
         if t[2] < rl - clr or t[0] > rr + clr or \
            t[3] < rt - clr or t[1] > rb + clr:
             return
-        obstacles.append((shape, t, clr))
+        obstacles.append((shape, t, clr, allow))
 
     def eff(item, layer):
         clr = max(_ts._net_clearance(snap, net),
@@ -187,7 +254,8 @@ def _collect_obstacles(snap, net, via_r, drill_r, region):
             return
         obstacles.append((pcbnew.SHAPE_SEGMENT(pos, pos, dia),
                           (pos.x - dia // 2, pos.y - dia // 2,
-                           pos.x + dia // 2, pos.y + dia // 2), hole_clr))
+                           pos.x + dia // 2, pos.y + dia // 2),
+                          hole_clr, None))
 
     for t in snap["tracks"]:
         same = t.GetNetCode() == net
@@ -203,11 +271,25 @@ def _collect_obstacles(snap, net, via_r, drill_r, region):
         d = p.GetDrillSize()
         same = p.GetNetCode() == net
         add_hole(p.GetPosition(), max(d.x, d.y), same)
+        if not any(p.IsOnLayer(layer) for layer in layers):
+            continue  # 銅の無いパッド(NPTH)は穴の登録だけ
+        exp = _pad_mask_expansion(p)
+        # 外側: 銅境界とレジスト開口境界の両方から margin 以上離す
+        out_clr = margin + max(exp, 0)
+        allow = None
+        if same and in_pad:
+            pb = p.GetBoundingBox()
+            if not (pb.GetRight() < rl or pb.GetLeft() > rr or
+                    pb.GetBottom() < rt or pb.GetTop() > rb):
+                # 内側: 両境界より margin 以上内側に完全に収まる領域
+                allow = _pad_inside_polys(
+                    p, layers, via_r + margin + max(0, -exp))
+                if allow:
+                    pad_regions.append(allow)
         for layer in layers:
             if p.IsOnLayer(layer):
-                # 同ネットのパッドも「重ねない」(ビア・イン・パッドを作らない)
                 add(p.GetEffectiveShape(layer), p.GetBoundingBox(),
-                    0 if same else eff(p, layer))
+                    out_clr if same else max(eff(p, layer), out_clr), allow)
     edge_clr = max(_ts._net_clearance(snap, net),
                    getattr(bds, "m_CopperEdgeClearance", 0))
     hole_edge = max(getattr(bds, "m_HoleToEdgeClearance", 0), 0)
@@ -223,7 +305,7 @@ def _collect_obstacles(snap, net, via_r, drill_r, region):
         except Exception:
             continue
     # 他ネットのベタ充填は障害物にしない(塗り直しでビアを避けて充填される)
-    return obstacles, holes
+    return obstacles, holes, pad_regions
 
 
 def _fit_areas(zone, via_r):
@@ -244,7 +326,7 @@ def _fit_areas(zone, via_r):
     return areas
 
 
-def _place_pass(board, zone, net, via_nm, drill_nm, pitch):
+def _place_pass(board, zone, net, via_nm, drill_nm, pitch, margin, in_pad):
     """塗り直し→格子状に置けるだけ置く、を1周。追加した数を返す。"""
     via_r = via_nm // 2
     drill_r = drill_nm // 2
@@ -261,7 +343,15 @@ def _place_pass(board, zone, net, via_nm, drill_nm, pitch):
     region = (bb.GetLeft() - via_r, bb.GetTop() - via_r,
               bb.GetRight() + via_r, bb.GetBottom() + via_r)
     snap = _ts.snapshot(board)
-    obstacles, holes = _collect_obstacles(snap, net, via_r, drill_r, region)
+    obstacles, holes, pad_regions = _collect_obstacles(
+        snap, net, via_r, drill_r, region, margin, in_pad)
+    outline = pcbnew.SHAPE_POLY_SET(zone.Outline())
+    outline.BuildBBoxCaches()
+
+    def in_pad_region(pt):
+        """同ネットパッドの許可領域(そのパッドの全銅箔層で内側)にいるか。"""
+        return any(all(q.Contains(pt, -1, 0, True) for q in polys)
+                   for polys in pad_regions)
 
     # 千鳥(六角格子)。格子より約15%多く入る。範囲の中央に揃える。
     # xの基準は全行で共通にする(行ごとにセンタリングすると半ピッチの
@@ -276,16 +366,24 @@ def _place_pass(board, zone, net, via_nm, drill_nm, pitch):
     def try_place(x, y):
         pt = pcbnew.VECTOR2I(int(x), int(y))
         if not any(a.Contains(pt, -1, 0, True) for a in areas):
-            return False
+            # ベタの塗りの外でも、選択ベタの輪郭内かつ同ネットパッドの
+            # 内側(ビア・イン・パッド)なら置ける(パッド経由で導通する)
+            if not (pad_regions and outline.Contains(pt, -1, 0, True)
+                    and in_pad_region(pt)):
+                return False
         if holes.blocked(x, y):  # 穴間の最小距離(重なりは常に不可)
             return False
         circle = pcbnew.SHAPE_CIRCLE(pt, via_r)
-        for shape, (l, t, r, b), clr in obstacles:
+        for shape, (l, t, r, b), clr, allow in obstacles:
             reach = via_r + clr
             if r < x - reach or l > x + reach or \
                b < y - reach or t > y + reach:
                 continue
             if shape.Collide(circle, clr):
+                # そのパッド自身の許可領域の内側なら衝突扱いにしない
+                if allow is not None and \
+                   all(q.Contains(pt, -1, 0, True) for q in allow):
+                    continue
                 return False
         v = pcbnew.PCB_VIA(board)
         v.SetViaType(pcbnew.VIATYPE_THROUGH)
@@ -307,37 +405,44 @@ def _place_pass(board, zone, net, via_nm, drill_nm, pitch):
     return added
 
 
-def stitch_zone(board, zone, via_nm, drill_nm, pitch_nm=0):
+def stitch_zone(board, zone, via_nm, drill_nm, pitch_nm=0,
+                margin_nm=0, in_pad=True):
     """ゾーンにビアを敷き詰めて board に追加する。
 
     打ったビアが孤立島を導通させて塗り面積が広がることがあるので、
     追加が無くなるまで塗り直し→配置を繰り返す(通常1〜2周)。
+    margin_nm 0 = 自動(_auto_margin)。in_pad = 同ネットパッド上を許可。
 
-    戻り値: {"added": 追加したビア数, "pitch": 使った間隔[nm], "note": 警告文}
+    戻り値: {"added": 追加したビア数, "pitch": 使った間隔[nm],
+             "margin": 使った境界マージン[nm], "note": 警告文}
     """
     net = zone.GetNetCode()
     if net <= 0:
-        return {"added": 0, "pitch": 0,
+        return {"added": 0, "pitch": 0, "margin": 0,
                 "note": "ネットの無いベタにはビアを打てません。"}
 
     pitch = max(int(pitch_nm), min_pitch(board, via_nm, drill_nm))
+    margin = int(margin_nm) if margin_nm > 0 else _auto_margin(board)
     total = 0
     for _ in range(5):
-        added = _place_pass(board, zone, net, via_nm, drill_nm, pitch)
+        added = _place_pass(board, zone, net, via_nm, drill_nm, pitch,
+                            margin, in_pad)
         total += added
         if not added:
             break
     note = ""
     if total == 0:
         note = "ベタの塗りつぶしが空か、ビアを置ける場所がありません。"
-    return {"added": total, "pitch": pitch, "note": note}
+    return {"added": total, "pitch": pitch, "margin": margin, "note": note}
 
 
-def stitch_zones(board, zones, via_nm, drill_nm, pitch_nm=0, refill=True):
+def stitch_zones(board, zones, via_nm, drill_nm, pitch_nm=0, refill=True,
+                 margin_nm=0, in_pad=True):
     """複数ゾーンを順に処理。戻り値: (合計追加数, 警告文リスト)。"""
     total, notes = 0, []
     for zone in zones:
-        r = stitch_zone(board, zone, via_nm, drill_nm, pitch_nm)
+        r = stitch_zone(board, zone, via_nm, drill_nm, pitch_nm,
+                        margin_nm, in_pad)
         total += r["added"]
         if r["note"]:
             notes.append(r["note"])
@@ -362,6 +467,12 @@ if wx is not None:
             self.via = self._mm_spin(grid, "ビア径 [mm]", via, 0.2, 3.0)
             self.drill = self._mm_spin(grid, "ドリル [mm]", drill, 0.1, 2.0)
             self.pitch = self._mm_spin(grid, "間隔 [mm] (0=最小)", 0.0, 0.0, 20.0)
+            self.margin = self._mm_spin(grid, "境界から [mm] (0=自動)",
+                                        0.0, 0.0, 5.0)
+            grid.Add(wx.StaticText(self, label=""), 0)
+            self.in_pad_check = wx.CheckBox(self, label="同ネットのパッド上も可")
+            self.in_pad_check.SetValue(True)
+            grid.Add(self.in_pad_check, 0)
             grid.Add(wx.StaticText(self, label=""), 0)
             self.refill_check = wx.CheckBox(self, label="作成後にベタを塗り直す")
             self.refill_check.SetValue(True)
@@ -387,6 +498,8 @@ if wx is not None:
                 "via": self.via.GetValue(),
                 "drill": self.drill.GetValue(),
                 "pitch": self.pitch.GetValue(),
+                "margin": self.margin.GetValue(),
+                "in_pad": self.in_pad_check.GetValue(),
                 "refill": self.refill_check.GetValue(),
             }
 
@@ -431,17 +544,21 @@ class ViaStitch(pcbnew.ActionPlugin):
                           "ベタにビアを敷き詰める",
                           wx.OK | wx.ICON_WARNING, parent)
             return
+        margin_nm = pcbnew.FromMM(float(params.get("margin", 0)))
         total, notes = stitch_zones(
             board, zones, via_nm, drill_nm,
             pitch_nm=pcbnew.FromMM(float(params.get("pitch", 0))),
-            refill=bool(params.get("refill", True)))
+            refill=bool(params.get("refill", True)),
+            margin_nm=margin_nm, in_pad=bool(params.get("in_pad", True)))
         pcbnew.Refresh()
-        if total == 0 or notes:
-            msg = "追加したビア: %d 個" % total
-            if notes:
-                msg += "\n" + "\n".join(sorted(set(notes)))
-            wx.MessageBox(msg, "ベタにビアを敷き詰める",
-                          wx.OK | wx.ICON_INFORMATION, parent)
+        msg = "追加したビア: %d 個" % total
+        if margin_nm <= 0:  # 自動で決めた値はユーザーに見せる
+            msg += "\n境界マージン: %.2fmm (自動)" % \
+                pcbnew.ToMM(_auto_margin(board))
+        if notes:
+            msg += "\n" + "\n".join(sorted(set(notes)))
+        wx.MessageBox(msg, "ベタにビアを敷き詰める",
+                      wx.OK | wx.ICON_INFORMATION, parent)
 
 
 ViaStitch().register()
