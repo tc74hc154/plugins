@@ -15,8 +15,8 @@
 #   - モジュール変数 ICON = "🧱" (絵文字1つ) でカードのアイコンを指定(省略可)
 #   - plugin.category がセクション見出しになる
 #   - モジュール変数 PANEL(リスト、または動的既定値を返す関数)でカードに
-#     コントロールを埋め込める: {"type": "run"|"dirgrid"|"check"|"number"|"choice",
-#     "key", "label", "default", ...}。実行時は入力値の dict がモジュール変数
+#     コントロールを埋め込める: {"type": "run"|"dirgrid"|"arrows"|"check"|"number"|
+#     "choice", "key", "label", "default", ...}。実行時は入力値の dict がモジュール変数
 #     PRESET に入ってから Run() が呼ばれる(Run側で消費し、無ければ従来ダイアログ)。
 #     PANEL 省略時は「実行」ボタンだけのカードになる
 """PCBプラグインをカテゴリ別の常駐パレットから選んで実行するランチャー。"""
@@ -303,6 +303,11 @@ const DIR_X = ["left", "center", "right"];
 const DIR_Y = ["top", "middle", "bottom"];
 const JP_X = {left: "左に寄せる", center: "左右中央", right: "右に寄せる"};
 const JP_Y = {top: "上に詰める", middle: "上下中央", bottom: "下に詰める"};
+// arrows: 4方向(←→↑↓)だけの矢印ボタン。値は "left"|"right"|"up"|"down"
+const ARROW_LAYOUT = [[null, "up", null], ["left", null, "right"], [null, "down", null]];
+const ARROW_GLYPH = {left: "\\u2190", right: "\\u2192", up: "\\u2191", down: "\\u2193"};
+const JP_ARROW = {left: "左の部品に寄せる", right: "右の部品に寄せる",
+                  up: "上の部品に寄せる", down: "下の部品に寄せる"};
 const list = document.getElementById("list");
 const q = document.getElementById("q");
 const status = document.getElementById("status");
@@ -338,6 +343,19 @@ function ctrlHtml(i, t, c) {
           '" title="' + escAttr(tip) + '">' + DIR_LABELS[r][col] + '</button>';
       }
     }
+    return h + '</div>';
+  }
+  if (c.type === "arrows") {
+    const cur = toolVals(t)[c.key] || c.last || "";
+    let h = '<div class="dirgrid">';
+    ARROW_LAYOUT.forEach(function (row) {
+      row.forEach(function (d) {
+        if (!d) { h += '<span></span>'; return; }
+        h += '<button class="dbtn' + (cur === d ? " last" : "") +
+          '" data-r="' + i + '" data-dir="' + d +
+          '" title="' + escAttr(JP_ARROW[d]) + '">' + ARROW_GLYPH[d] + '</button>';
+      });
+    });
     return h + '</div>';
   }
   if (c.type === "check") {
@@ -379,7 +397,9 @@ function render() {
     }
     const panel = t.panel || [];
     const runs = panel.filter(function (c) { return c.type === "run"; });
-    const grids = panel.filter(function (c) { return c.type === "dirgrid"; });
+    const grids = panel.filter(function (c) {
+      return c.type === "dirgrid" || c.type === "arrows";
+    });
     const opts = panel.filter(function (c) {
       return c.type === "check" || c.type === "number" || c.type === "choice";
     });
@@ -431,7 +451,7 @@ function gather(i) {
   const t = TOOLS[i];
   const params = {};
   (t.panel || []).forEach(function (c) {
-    if (!c.key || c.type === "dirgrid" || c.type === "run") return;
+    if (!c.key || c.type === "dirgrid" || c.type === "arrows" || c.type === "run") return;
     const v = valOf(t, c);
     params[c.key] = (typeof v === "number" && isNaN(v)) ? c.default : v;
   });
@@ -471,6 +491,15 @@ list.addEventListener("click", function (e) {
       extra = {};
       extra[dg.key] = [r.dataset.ax, r.dataset.ay];
       toolVals(TOOLS[i])[dg.key] = extra[dg.key];
+    }
+  } else if (r.dataset.dir) {  // 矢印ボタン: 押した向きをパラメータに載せる
+    const ar = (TOOLS[i].panel || []).find(function (c) {
+      return c.type === "arrows";
+    });
+    if (ar) {
+      extra = {};
+      extra[ar.key] = r.dataset.dir;
+      toolVals(TOOLS[i])[ar.key] = r.dataset.dir;
     }
   }
   runTool(i, extra);
