@@ -34,19 +34,22 @@ LABEL = "ビアを敷き詰める"      # パレットのタイルに表示す�
 
 PRESET = None  # パレットが実行直前に渡すパラメータ(Run()が消費、無ければダイアログ)
 
+# 既定値は JLCPCB 2層エコノミーで追加費用なしの最高密度 (capabilities 2026-08確認):
+# ドリル0.15mmは常に有料、0.2/0.25mmは「ビア径0.45mm以上」なら無料。
+# ビア穴間の最小距離は0.2mm。最小ピッチ = max(ビア径, ドリル+穴間) なので
+# 0.45/0.25 でピッチ0.45mmが最密 (0.3/0.4 だと0.5mm)。
+JLC_VIA_MM = 0.45
+JLC_DRILL_MM = 0.25
+JLC_VIA_H2H_MM = 0.2
 
-def _board_via_defaults():
-    """基板の現在のビア径/ドリル [mm]。取れなければ 0.6/0.3。"""
-    try:
-        bds = pcbnew.GetBoard().GetDesignSettings()
-        return (round(pcbnew.ToMM(bds.GetCurrentViaSize()), 2),
-                round(pcbnew.ToMM(bds.GetCurrentViaDrill()), 2))
-    except Exception:
-        return 0.6, 0.3
+
+def _via_defaults():
+    """ビア径/ドリルの既定値 [mm] = JLCPCB 2層エコノミーの最密。"""
+    return JLC_VIA_MM, JLC_DRILL_MM
 
 
 def PANEL():  # パレット埋め込みUIの定義(pack_launcher が参照。規約はREADME)
-    via, drill = _board_via_defaults()
+    via, drill = _via_defaults()
     return [
         {"type": "number", "key": "via", "label": "ビア径", "unit": "mm",
          "default": via, "min": 0.2, "max": 3.0, "step": 0.05},
@@ -90,12 +93,15 @@ def min_pitch(board, via_nm, drill_nm):
 
     新ビアは全て同ネットなので銅クリアランスは掛からない。効くのは
     穴間の最小距離と、ビア（銅）同士を重ねない、の2つ。
+    穴間は基板設定とJLCPCBのビア穴間0.2mmの厳しい方を使う
+    （基板設定が0や未設定でも製造限界は割らない）。
     """
     h2h = 0
     try:
         h2h = max(board.GetDesignSettings().m_HoleToHoleMin, 0)
     except Exception:
         pass
+    h2h = max(h2h, pcbnew.FromMM(JLC_VIA_H2H_MM))
     return max(via_nm, drill_nm + h2h) + pcbnew.FromMM(0.01)
 
 
@@ -460,7 +466,7 @@ if wx is not None:
         def __init__(self, parent):
             super().__init__(parent, title="ベタにビアを敷き詰める",
                              style=wx.DEFAULT_DIALOG_STYLE)
-            via, drill = _board_via_defaults()
+            via, drill = _via_defaults()
             root = wx.BoxSizer(wx.VERTICAL)
             grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=10)
             grid.AddGrowableCol(1)
@@ -536,7 +542,7 @@ class ViaStitch(pcbnew.ActionPlugin):
             finally:
                 dlg.Destroy()
 
-        dvia, ddrill = _board_via_defaults()
+        dvia, ddrill = _via_defaults()
         via_nm = pcbnew.FromMM(float(params.get("via", dvia)))
         drill_nm = pcbnew.FromMM(float(params.get("drill", ddrill)))
         if drill_nm >= via_nm:
